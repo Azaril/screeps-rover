@@ -1,0 +1,10 @@
+[package]
+name = "screeps-rover"
+version = "0.1.0"
+authors = ["William Archbell <william@archbell.com>"]
+edition = "2018"
+
+[dependencies]
+screeps-game-api = { git = "https://github.com/Azaril/screeps-game-api", branch = "pathfinding" }
+screeps-cache = { git = "https://github.com/Azaril/screeps-cache.git" }
+serde = "1.0"

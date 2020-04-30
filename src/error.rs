@@ -1,0 +1,1 @@
+pub type MovementError = String;
