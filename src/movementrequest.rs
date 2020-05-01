@@ -11,23 +11,10 @@ impl RoomOptions {
 }
 
 pub struct MovementRequest {
-    destination: RoomPosition,
-    range: u32,
-    room_options: RoomOptions,
-}
-
-impl MovementRequest {
-    pub fn destination(&self) -> RoomPosition {
-        self.destination
-    }
-
-    pub fn range(&self) -> u32 {
-        self.range
-    }
-
-    pub fn room_options(&self) -> &RoomOptions {
-        &self.room_options
-    }
+    pub (crate) destination: RoomPosition,
+    pub (crate) range: u32,
+    pub (crate) room_options: Option<RoomOptions>,
+    pub (crate) visualization: Option<PolyStyle>,
 }
 
 impl Default for RoomOptions {
@@ -43,31 +30,40 @@ impl MovementRequest {
         MovementRequest {
             destination,
             range: 0,
-            room_options: RoomOptions::default()
+            room_options: None,
+            visualization: None
         }
     }
+}
 
-    pub fn move_to_with_options(destination: RoomPosition, room_options: RoomOptions) -> MovementRequest {
-        MovementRequest {
-            destination,
-            range: 0,
-            room_options
+pub struct MovementRequestBuilder<'a> {
+    request: &'a mut MovementRequest
+}
+
+impl<'a> Into<MovementRequestBuilder<'a>> for &'a mut MovementRequest {
+    fn into(self) -> MovementRequestBuilder<'a> {
+        MovementRequestBuilder {
+            request: self
         }
     }
+}
 
-    pub fn move_to_range(destination: RoomPosition, range: u32) -> MovementRequest {
-        MovementRequest { 
-            destination, 
-            range,
-            room_options: RoomOptions::default()
-        }
+impl<'a> MovementRequestBuilder<'a> {
+    pub fn range(&mut self, range: u32) -> &mut Self {
+        self.request.range = range;
+
+        self
     }
 
-    pub fn move_to_range_with_options(destination: RoomPosition, range: u32, room_options: RoomOptions) -> MovementRequest {
-        MovementRequest {
-            destination,
-            range,
-            room_options
-        }
+    pub fn room_options(&mut self, options: RoomOptions) -> &mut Self {
+        self.request.room_options = Some(options);
+
+        self
+    }
+    
+    pub fn visualization(&mut self, style: PolyStyle) -> &mut Self {
+        self.request.visualization = Some(style);
+
+        self
     }
 }

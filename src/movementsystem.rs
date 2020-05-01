@@ -28,16 +28,11 @@ impl<Handle> MovementData<Handle> where Handle: Hash + Eq {
         }
     }
 
-    fn request(&mut self, entity: Handle, request: MovementRequest) {
-        self.requests.insert(entity, request);
-    }
-
-    pub fn move_to(&mut self, entity: Handle, destination: RoomPosition) {
-        self.request(entity, MovementRequest::move_to(destination));
-    }
-
-    pub fn move_to_range(&mut self, entity: Handle, destination: RoomPosition, range: u32) {
-        self.request(entity, MovementRequest::move_to_range(destination, range));
+    pub fn move_to(&mut self, entity: Handle, destination: RoomPosition) -> MovementRequestBuilder {
+        self.requests.entry(entity)
+            .and_modify(|e| *e = MovementRequest::move_to(destination))
+            .or_insert_with(|| MovementRequest::move_to(destination))
+            .into()        
     }
 }
 
@@ -59,8 +54,8 @@ pub trait MovementSystemExternal<Handle> {
 
 impl<Handle> MovementSystem<Handle> where Handle: Hash + Eq + Copy {
     pub fn process_inbuilt<S>(external: &mut S, data: MovementData<Handle>) where S: MovementSystemExternal<Handle> {
-        for (entity, request) in data.requests.iter() {
-            match Self::process_request_inbuilt(external, *entity, &request) {
+        for (entity, request) in data.requests.into_iter() {
+            match Self::process_request_inbuilt(external, entity, request) {
                 Ok(()) => {}
                 Err(_err) => {},
             }
@@ -68,40 +63,58 @@ impl<Handle> MovementSystem<Handle> where Handle: Hash + Eq + Copy {
     }
     
     pub fn process<S>(external: &mut S, cost_matrix_system: &mut CostMatrixSystem, data: MovementData<Handle>) where S: MovementSystemExternal<Handle> {
-        for (entity, request) in data.requests.iter() {
-            match Self::process_request(external, cost_matrix_system, *entity, &request) {
+        for (entity, request) in data.requests.into_iter() {
+            match Self::process_request(external, cost_matrix_system, entity, request) {
                 Ok(()) => {}
                 Err(_err) => {},
             }
         }
     }
 
-    fn process_request_inbuilt<S>(external: &mut S, entity: Handle, request: &MovementRequest) -> Result<(), MovementError> where S: MovementSystemExternal<Handle> {
+    fn process_request_inbuilt<S>(external: &mut S, entity: Handle, mut request: MovementRequest) -> Result<(), MovementError> where S: MovementSystemExternal<Handle> {
         let creep = external.get_creep(entity)?;
 
         const REUSE_PATH_LENGTH: u32 = 10;
+        let default_visualization_style = None;
 
         let move_options = MoveToOptions::new()
-            .range(request.range())
+            .range(request.range)
             .reuse_path(REUSE_PATH_LENGTH);
 
-        match creep.move_to_with_options(&request.destination(), move_options) {
+        let vis_move_options = if let Some(vis) = request.visualization.take() {
+            move_options.visualize_path_style(vis)
+        } else if let Some(vis) = default_visualization_style.clone() {
+            move_options.visualize_path_style(vis)
+        } else {
+            move_options
+        };
+        
+        match creep.move_to_with_options(&request.destination, vis_move_options) {
             ReturnCode::Ok => return Ok(()),
             err => return Err(format!("Move error: {:?}", err)),
         }
     }
 
-    fn process_request<S>(external: &mut S, cost_matrix_system: &mut CostMatrixSystem, entity: Handle, request: &MovementRequest) -> Result<(), MovementError> where S: MovementSystemExternal<Handle> {
+    fn process_request<S>(external: &mut S, cost_matrix_system: &mut CostMatrixSystem, entity: Handle, mut request: MovementRequest) -> Result<(), MovementError> where S: MovementSystemExternal<Handle> {
         let creep = external.get_creep(entity)?;
 
         const REUSE_PATH_LENGTH: u32 = 10;
+        let default_visualization_style = None;
 
         let move_options = MoveToOptions::new()
-            .range(request.range())
+            .range(request.range)
             .reuse_path(REUSE_PATH_LENGTH)
             .no_path_finding(true);
 
-        match creep.move_to_with_options(&request.destination(), move_options) {
+        let vis_move_options = if let Some(vis) = request.visualization.clone().take() {
+            move_options.visualize_path_style(vis)
+        } else if let Some(vis) = default_visualization_style.clone() {
+            move_options.visualize_path_style(vis)
+        } else {
+            move_options
+        };
+
+        match creep.move_to_with_options(&request.destination, vis_move_options) {
             ReturnCode::Ok => return Ok(()),
             ReturnCode::NotFound => {},
             err => return Err(format!("Move error: {:?}", err)),
@@ -109,11 +122,12 @@ impl<Handle> MovementSystem<Handle> where Handle: Hash + Eq + Copy {
 
         let creep_pos = creep.pos();
         let creep_room_name = creep_pos.room_name();
+        let room_options = request.room_options.take().unwrap_or_default();
 
         let room_path = game::map::find_route_with_callback(
             creep_room_name, 
-            request.destination().room_name(),
-            |to_room_name, from_room_name| external.get_room_weight(from_room_name, to_room_name, creep_room_name, request.room_options()).unwrap_or(f64::INFINITY)
+            request.destination.room_name(),
+            |to_room_name, from_room_name| external.get_room_weight(from_room_name, to_room_name, creep_room_name, &room_options).unwrap_or(f64::INFINITY)
         ).map_err(|e| format!("Could not find path between rooms: {:?}", e))?;
 
         let room_names: HashSet<_> = room_path
@@ -129,7 +143,7 @@ impl<Handle> MovementSystem<Handle> where Handle: Hash + Eq + Copy {
         };
 
         let move_options = MoveToOptions::new()
-            .range(request.range())
+            .range(request.range)
             .reuse_path(REUSE_PATH_LENGTH)
             .cost_callback(|room_name: RoomName, mut cost_matrix: CostMatrix| -> MultiRoomCostResult {
                 if room_names.contains(&room_name) {
@@ -142,7 +156,15 @@ impl<Handle> MovementSystem<Handle> where Handle: Hash + Eq + Copy {
                 }
             });
 
-        match creep.move_to_with_options(&request.destination(), move_options) {
+        let vis_move_options = if let Some(vis) = request.visualization.clone().take() {
+            move_options.visualize_path_style(vis)
+        } else if let Some(vis) = default_visualization_style.clone() {
+            move_options.visualize_path_style(vis)
+        } else {
+            move_options
+        };
+
+        match creep.move_to_with_options(&request.destination, vis_move_options) {
             ReturnCode::Ok => Ok(()),
             //TODO: Replace with own pathfinding.
             ReturnCode::NoPath => Ok(()),
