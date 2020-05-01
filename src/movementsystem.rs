@@ -52,6 +52,7 @@ pub trait MovementSystemExternal<Handle> {
     }
 }
 
+#[cfg_attr(feature = "profile", screeps_timing_annotate::timing)]
 impl<Handle> MovementSystem<Handle> where Handle: Hash + Eq + Copy {
     pub fn process_inbuilt<S>(external: &mut S, data: MovementData<Handle>) where S: MovementSystemExternal<Handle> {
         for (entity, request) in data.requests.into_iter() {

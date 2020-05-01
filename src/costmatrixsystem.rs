@@ -109,18 +109,21 @@ impl CostMatrixCache {
         let mut room = self.get_room(room_name);
 
         if configuration.structures {
-            let structures = room.get_structures().ok_or("Structures not available")?;
-            structures.apply_to(&mut *cost_matrix);
+            if let Some(structures) = room.get_structures() {
+                structures.apply_to(&mut *cost_matrix);
+            }
         }
 
         if configuration.friendly_creeps {
-            let friendly_creeps = room.get_friendly_creeps().ok_or("Friendly creeps not available")?;
-            friendly_creeps.apply_to(&mut *cost_matrix);
+            if let Some(friendly_creeps) = room.get_friendly_creeps() {
+                friendly_creeps.apply_to(&mut *cost_matrix);
+            }
         }
         
         if configuration.hostile_creeps {
-            let hostile_creeps = room.get_hostile_creeps().ok_or("Hostile creeps not available")?;
-            hostile_creeps.apply_to(&mut *cost_matrix);
+            if let Some(hostile_creeps) = room.get_hostile_creeps() {
+                hostile_creeps.apply_to(&mut *cost_matrix);
+            }
         }
 
         Ok(())
@@ -136,7 +139,7 @@ impl<'a> CostMatrixRoomAccessor<'a> {
     pub fn get_structures(&mut self) -> Option<&LinearCostMatrix> {
         let room_name = self.room_name;
 
-        let expiration = |data: &CostMatrixTypeCache<_>| game::time() - data.last_updated > 0;
+        let expiration = move |data: &CostMatrixTypeCache<_>| game::time() - data.last_updated > 0 && game::rooms::get(room_name).is_some();
         let filler = move || {
             let room = game::rooms::get(room_name)?;
 
