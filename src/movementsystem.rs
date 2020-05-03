@@ -36,10 +36,6 @@ impl<Handle> MovementData<Handle> where Handle: Hash + Eq {
     }
 }
 
-pub struct MovementSystem<Handle> {
-    phantom: std::marker::PhantomData<Handle>
-}
-
 pub trait MovementSystemExternal<Handle> {
     fn get_creep(&self, entity: Handle) -> Result<Creep, MovementError>;
 
@@ -52,39 +48,60 @@ pub trait MovementSystemExternal<Handle> {
     }
 }
 
+pub struct MovementSystem<'a, Handle> {
+    cost_matrix_system: &'a mut CostMatrixSystem,
+    default_visualization_style: Option<PolyStyle>,
+    reuse_path_length: u32,
+    phantom: std::marker::PhantomData<Handle>,
+}
+
 #[cfg_attr(feature = "profile", screeps_timing_annotate::timing)]
-impl<Handle> MovementSystem<Handle> where Handle: Hash + Eq + Copy {
-    pub fn process_inbuilt<S>(external: &mut S, data: MovementData<Handle>) where S: MovementSystemExternal<Handle> {
+impl<'a, Handle> MovementSystem<'a, Handle> where Handle: Hash + Eq + Copy {
+    pub fn new(cost_matrix_system: &'a mut CostMatrixSystem) -> Self {
+        Self {
+            cost_matrix_system,
+            default_visualization_style: None,
+            reuse_path_length: 5,
+            phantom: std::marker::PhantomData
+        }
+    }
+
+    pub fn set_default_visualization_style(&mut self, style: PolyStyle) {
+        self.default_visualization_style = Some(style);
+    }
+
+    pub fn set_reuse_path_length(&mut self, length: u32) {
+        self.reuse_path_length = length;
+    }
+
+    pub fn process_inbuilt<S>(&mut self, external: &mut S, data: MovementData<Handle>) where S: MovementSystemExternal<Handle> {
         for (entity, request) in data.requests.into_iter() {
-            match Self::process_request_inbuilt(external, entity, request) {
+            match self.process_request_inbuilt(external, entity, request) {
                 Ok(()) => {}
                 Err(_err) => {},
             }
         }
     }
     
-    pub fn process<S>(external: &mut S, cost_matrix_system: &mut CostMatrixSystem, data: MovementData<Handle>) where S: MovementSystemExternal<Handle> {
+    pub fn process<S>(&mut self, external: &mut S, data: MovementData<Handle>) where S: MovementSystemExternal<Handle> {
         for (entity, request) in data.requests.into_iter() {
-            match Self::process_request(external, cost_matrix_system, entity, request) {
+            match self.process_request(external, entity, request) {
                 Ok(()) => {}
                 Err(_err) => {},
             }
         }
     }
 
-    fn process_request_inbuilt<S>(external: &mut S, entity: Handle, mut request: MovementRequest) -> Result<(), MovementError> where S: MovementSystemExternal<Handle> {
+    fn process_request_inbuilt<S>(&mut self, external: &mut S, entity: Handle, mut request: MovementRequest) -> Result<(), MovementError> where S: MovementSystemExternal<Handle> {
         let creep = external.get_creep(entity)?;
-
-        const REUSE_PATH_LENGTH: u32 = 10;
-        let default_visualization_style = None;
 
         let move_options = MoveToOptions::new()
             .range(request.range)
-            .reuse_path(REUSE_PATH_LENGTH);
+            .reuse_path(self.reuse_path_length);
 
         let vis_move_options = if let Some(vis) = request.visualization.take() {
             move_options.visualize_path_style(vis)
-        } else if let Some(vis) = default_visualization_style.clone() {
+        } else if let Some(vis) = self.default_visualization_style.clone() {
             move_options.visualize_path_style(vis)
         } else {
             move_options
@@ -96,20 +113,17 @@ impl<Handle> MovementSystem<Handle> where Handle: Hash + Eq + Copy {
         }
     }
 
-    fn process_request<S>(external: &mut S, cost_matrix_system: &mut CostMatrixSystem, entity: Handle, mut request: MovementRequest) -> Result<(), MovementError> where S: MovementSystemExternal<Handle> {
+    fn process_request<S>(&mut self, external: &mut S, entity: Handle, mut request: MovementRequest) -> Result<(), MovementError> where S: MovementSystemExternal<Handle> {
         let creep = external.get_creep(entity)?;
-
-        const REUSE_PATH_LENGTH: u32 = 10;
-        let default_visualization_style = None;
 
         let move_options = MoveToOptions::new()
             .range(request.range)
-            .reuse_path(REUSE_PATH_LENGTH)
+            .reuse_path(self.reuse_path_length)
             .no_path_finding(true);
 
         let vis_move_options = if let Some(vis) = request.visualization.clone().take() {
             move_options.visualize_path_style(vis)
-        } else if let Some(vis) = default_visualization_style.clone() {
+        } else if let Some(vis) = self.default_visualization_style.clone() {
             move_options.visualize_path_style(vis)
         } else {
             move_options
@@ -143,9 +157,11 @@ impl<Handle> MovementSystem<Handle> where Handle: Hash + Eq + Copy {
             hostile_creeps: true
         };
 
+        let cost_matrix_system = &mut self.cost_matrix_system;
+
         let move_options = MoveToOptions::new()
             .range(request.range)
-            .reuse_path(REUSE_PATH_LENGTH)
+            .reuse_path(self.reuse_path_length)
             .cost_callback(|room_name: RoomName, mut cost_matrix: CostMatrix| -> MultiRoomCostResult {
                 if room_names.contains(&room_name) {
                     match cost_matrix_system.apply_cost_matrix(room_name, &mut cost_matrix, &configration) {
@@ -159,7 +175,7 @@ impl<Handle> MovementSystem<Handle> where Handle: Hash + Eq + Copy {
 
         let vis_move_options = if let Some(vis) = request.visualization.clone().take() {
             move_options.visualize_path_style(vis)
-        } else if let Some(vis) = default_visualization_style.clone() {
+        } else if let Some(vis) = self.default_visualization_style.clone() {
             move_options.visualize_path_style(vis)
         } else {
             move_options
