@@ -1,4 +1,3 @@
-use screeps::*;
 use screeps::pathfinder::*;
 use serde::*;
 
@@ -13,10 +12,6 @@ impl Location {
         Location {
             packed: ((x << 8) | y) as u16,
         }
-    }
-
-    pub fn from_pos(pos: RoomPosition) -> Self {
-        Self::from_coords(pos.x(), pos.y())
     }
 
     #[inline]
@@ -37,10 +32,6 @@ impl Location {
     #[inline]
     pub fn from_packed(packed: u16) -> Self {
         Location { packed }
-    }
-
-    pub fn to_room_position(self, room: RoomName) -> RoomPosition {
-        RoomPosition::new(self.x() as u32, self.y() as u32, room)
     }
 
     pub fn distance_to(self, other: Self) -> u8 {
