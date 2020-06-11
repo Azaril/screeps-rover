@@ -1,14 +1,14 @@
 use super::costmatrix::*;
-use screeps::*;
 use screeps::pathfinder::CostMatrix;
-use std::collections::HashMap;
+use screeps::*;
 use screeps_cache::*;
 use serde::*;
+use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize)]
 pub struct CostMatrixTypeCache<T> {
     last_updated: u32,
-    data: T
+    data: T,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -25,20 +25,20 @@ impl CostMatrixRoomEntry {
         CostMatrixRoomEntry {
             structures: None,
             friendly_creeps: None,
-            hostile_creeps: None
+            hostile_creeps: None,
         }
     }
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct CostMatrixCache {
-    rooms: HashMap<RoomName, CostMatrixRoomEntry>
+    rooms: HashMap<RoomName, CostMatrixRoomEntry>,
 }
 
 pub trait CostMatrixStorage {
     fn get_cache(&self, segment: u32) -> Result<CostMatrixCache, String>;
 
-    fn set_cache(&mut self, segment:u32, data: &CostMatrixCache) -> Result<(), String>;
+    fn set_cache(&mut self, segment: u32, data: &CostMatrixCache) -> Result<(), String>;
 }
 
 pub struct CostMatrixConfiguration {
@@ -50,7 +50,7 @@ pub struct CostMatrixConfiguration {
 pub struct CostMatrixSystem {
     storage: Box<dyn CostMatrixStorage>,
     storage_segment: u32,
-    cache: Option<CostMatrixCache>
+    cache: Option<CostMatrixCache>,
 }
 
 impl CostMatrixSystem {
@@ -58,7 +58,7 @@ impl CostMatrixSystem {
         CostMatrixSystem {
             storage,
             storage_segment,
-            cache: None
+            cache: None,
         }
     }
 
@@ -67,10 +67,17 @@ impl CostMatrixSystem {
         let cache = &self.cache;
         let storage_segment = self.storage_segment;
 
-        cache.as_ref().map(|c| storage.set_cache(storage_segment, c));        
+        cache
+            .as_ref()
+            .map(|c| storage.set_cache(storage_segment, c));
     }
-    
-    pub fn apply_cost_matrix(&mut self, room_name: RoomName, cost_matrix: &mut CostMatrix, configuration: &CostMatrixConfiguration) -> Result<(), String> {
+
+    pub fn apply_cost_matrix(
+        &mut self,
+        room_name: RoomName,
+        cost_matrix: &mut CostMatrix,
+        configuration: &CostMatrixConfiguration,
+    ) -> Result<(), String> {
         let cache = self.get_cache();
 
         cache.apply_cost_matrix(room_name, cost_matrix, configuration)
@@ -88,24 +95,27 @@ impl CostMatrixSystem {
 impl Default for CostMatrixCache {
     fn default() -> CostMatrixCache {
         CostMatrixCache {
-            rooms: HashMap::new()
+            rooms: HashMap::new(),
         }
     }
 }
 
 impl CostMatrixCache {
     fn get_room(&mut self, room_name: RoomName) -> CostMatrixRoomAccessor {
-        let entry = self.rooms
+        let entry = self
+            .rooms
             .entry(room_name)
             .or_insert_with(CostMatrixRoomEntry::new);
 
-        CostMatrixRoomAccessor {
-            room_name,
-            entry
-        }
+        CostMatrixRoomAccessor { room_name, entry }
     }
 
-    pub fn apply_cost_matrix(&mut self, room_name: RoomName, cost_matrix: &mut CostMatrix, configuration: &CostMatrixConfiguration) -> Result<(), String> {
+    pub fn apply_cost_matrix(
+        &mut self,
+        room_name: RoomName,
+        cost_matrix: &mut CostMatrix,
+        configuration: &CostMatrixConfiguration,
+    ) -> Result<(), String> {
         let mut room = self.get_room(room_name);
 
         if configuration.structures {
@@ -119,7 +129,7 @@ impl CostMatrixCache {
                 friendly_creeps.apply_to(&mut *cost_matrix);
             }
         }
-        
+
         if configuration.hostile_creeps {
             if let Some(hostile_creeps) = room.get_hostile_creeps() {
                 hostile_creeps.apply_to(&mut *cost_matrix);
@@ -132,14 +142,16 @@ impl CostMatrixCache {
 
 pub struct CostMatrixRoomAccessor<'a> {
     room_name: RoomName,
-    entry: &'a mut CostMatrixRoomEntry
+    entry: &'a mut CostMatrixRoomEntry,
 }
 
 impl<'a> CostMatrixRoomAccessor<'a> {
     pub fn get_structures(&mut self) -> Option<&LinearCostMatrix> {
         let room_name = self.room_name;
 
-        let expiration = move |data: &CostMatrixTypeCache<_>| game::time() - data.last_updated > 0 && game::rooms::get(room_name).is_some();
+        let expiration = move |data: &CostMatrixTypeCache<_>| {
+            game::time() - data.last_updated > 0 && game::rooms::get(room_name).is_some()
+        };
         let filler = move || {
             let room = game::rooms::get(room_name)?;
 
@@ -149,15 +161,9 @@ impl<'a> CostMatrixRoomAccessor<'a> {
 
             for structure in structures.iter() {
                 let cost = match structure {
-                    Structure::Rampart(_) | Structure::Road(_) => {
-                        None
-                    }
-                    Structure::Container(_) => {
-                        Some(2)
-                    },
-                    _ => {
-                        Some(u8::MAX)
-                    }
+                    Structure::Rampart(_) | Structure::Road(_) => None,
+                    Structure::Container(_) => Some(2),
+                    _ => Some(u8::MAX),
                 };
 
                 if let Some(cost) = cost {
@@ -169,13 +175,17 @@ impl<'a> CostMatrixRoomAccessor<'a> {
 
             let entry = CostMatrixTypeCache {
                 last_updated: game::time(),
-                data: matrix
+                data: matrix,
             };
 
             Some(entry)
         };
 
-        self.entry.structures.maybe_access(expiration, filler).get().map(|d| &d.data)
+        self.entry
+            .structures
+            .maybe_access(expiration, filler)
+            .get()
+            .map(|d| &d.data)
     }
 
     pub fn get_friendly_creeps(&mut self) -> Option<&LinearCostMatrix> {
@@ -200,13 +210,17 @@ impl<'a> CostMatrixRoomAccessor<'a> {
 
             let entry = CostMatrixTypeCache {
                 last_updated: game::time(),
-                data: matrix
+                data: matrix,
             };
 
             Some(entry)
         };
 
-        self.entry.friendly_creeps.maybe_access(expiration, filler).get().map(|d| &d.data)
+        self.entry
+            .friendly_creeps
+            .maybe_access(expiration, filler)
+            .get()
+            .map(|d| &d.data)
     }
 
     pub fn get_hostile_creeps(&mut self) -> Option<&LinearCostMatrix> {
@@ -231,12 +245,16 @@ impl<'a> CostMatrixRoomAccessor<'a> {
 
             let entry = CostMatrixTypeCache {
                 last_updated: game::time(),
-                data: matrix
+                data: matrix,
             };
 
             Some(entry)
         };
 
-        self.entry.hostile_creeps.maybe_access(expiration, filler).get().map(|d| &d.data)
+        self.entry
+            .hostile_creeps
+            .maybe_access(expiration, filler)
+            .get()
+            .map(|d| &d.data)
     }
 }

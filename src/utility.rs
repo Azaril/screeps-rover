@@ -1,5 +1,5 @@
-use screeps::*;
 use screeps::game::map::*;
+use screeps::*;
 
 pub fn can_traverse_between_rooms(from: RoomName, to: RoomName) -> bool {
     let from_room_status = game::map::get_room_status(from);

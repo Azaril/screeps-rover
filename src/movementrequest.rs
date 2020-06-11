@@ -11,16 +11,16 @@ impl RoomOptions {
 }
 
 pub struct MovementRequest {
-    pub (crate) destination: RoomPosition,
-    pub (crate) range: u32,
-    pub (crate) room_options: Option<RoomOptions>,
-    pub (crate) visualization: Option<PolyStyle>,
+    pub(crate) destination: RoomPosition,
+    pub(crate) range: u32,
+    pub(crate) room_options: Option<RoomOptions>,
+    pub(crate) visualization: Option<PolyStyle>,
 }
 
 impl Default for RoomOptions {
     fn default() -> Self {
         RoomOptions {
-            allow_hostile: false
+            allow_hostile: false,
         }
     }
 }
@@ -31,20 +31,18 @@ impl MovementRequest {
             destination,
             range: 0,
             room_options: None,
-            visualization: None
+            visualization: None,
         }
     }
 }
 
 pub struct MovementRequestBuilder<'a> {
-    request: &'a mut MovementRequest
+    request: &'a mut MovementRequest,
 }
 
 impl<'a> Into<MovementRequestBuilder<'a>> for &'a mut MovementRequest {
     fn into(self) -> MovementRequestBuilder<'a> {
-        MovementRequestBuilder {
-            request: self
-        }
+        MovementRequestBuilder { request: self }
     }
 }
 
@@ -60,7 +58,7 @@ impl<'a> MovementRequestBuilder<'a> {
 
         self
     }
-    
+
     pub fn visualization(&mut self, style: PolyStyle) -> &mut Self {
         self.request.visualization = Some(style);
 
