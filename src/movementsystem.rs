@@ -199,9 +199,12 @@ where
 
         let cost_matrix_system = &mut self.cost_matrix_system;
 
+        let max_ops = room_names.len() as u32 * 2000;
+
         let move_options = MoveToOptions::new()
             .range(request.range)
             .reuse_path(self.reuse_path_length)
+            .max_ops(max_ops)
             .cost_callback(
                 |room_name: RoomName, mut cost_matrix: CostMatrix| -> MultiRoomCostResult {
                     if room_names.contains(&room_name) {
