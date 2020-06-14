@@ -50,7 +50,6 @@ pub trait MovementSystemExternal<Handle> {
         &self,
         from_room_name: RoomName,
         to_room_name: RoomName,
-        _current_room_name: RoomName,
         _room_options: &RoomOptions,
     ) -> Option<f64> {
         if !can_traverse_between_rooms(from_room_name, to_room_name) {
@@ -182,13 +181,16 @@ where
             request.destination.room_name(),
             |to_room_name, from_room_name| {
                 external
-                    .get_room_weight(from_room_name, to_room_name, creep_room_name, &room_options)
+                    .get_room_weight(from_room_name, to_room_name, &room_options)
                     .unwrap_or(f64::INFINITY)
             },
         )
         .map_err(|e| format!("Could not find path between rooms: {:?}", e))?;
 
-        let room_names: HashSet<_> = room_path.iter().map(|step| step.room).collect();
+        let mut room_names: HashSet<_> = room_path.iter().map(|step| step.room).collect();
+
+        room_names.insert(creep_room_name);
+        room_names.insert(request.destination.room_name());
 
         //TODO: Expose pathing configuration.
         let configration = CostMatrixConfiguration {
