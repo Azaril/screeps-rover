@@ -46,7 +46,7 @@ where
 pub trait MovementSystemExternal<Handle> {
     fn get_creep(&self, entity: Handle) -> Result<Creep, MovementError>;
 
-    fn get_room_weight(
+    fn get_room_cost(
         &self,
         from_room_name: RoomName,
         to_room_name: RoomName,
@@ -176,21 +176,29 @@ where
         let creep_room_name = creep_pos.room_name();
         let room_options = request.room_options.take().unwrap_or_default();
 
+        let destination_room = request.destination.room_name();
+
         let room_path = game::map::find_route_with_callback(
             creep_room_name,
             request.destination.room_name(),
             |to_room_name, from_room_name| {
-                external
-                    .get_room_weight(from_room_name, to_room_name, &room_options)
-                    .unwrap_or(f64::INFINITY)
+                if to_room_name == destination_room {
+                    0.0
+                } else {
+                    external
+                        .get_room_cost(from_room_name, to_room_name, &room_options)
+                        .unwrap_or(f64::INFINITY)
+                }
             },
         )
         .map_err(|e| format!("Could not find path between rooms: {:?}", e))?;
 
-        let mut room_names: HashSet<_> = room_path.iter().map(|step| step.room).collect();
-
-        room_names.insert(creep_room_name);
-        room_names.insert(request.destination.room_name());
+        let room_names: HashSet<_> = room_path
+            .iter()
+            .map(|step| step.room)
+            .chain(std::iter::once(creep_room_name))
+            .chain(std::iter::once(destination_room))
+            .collect();
 
         //TODO: Expose pathing configuration.
         let configration = CostMatrixConfiguration {
@@ -216,7 +224,7 @@ where
                             &configration,
                         ) {
                             Ok(()) => cost_matrix.into(),
-                            Err(_err) => MultiRoomCostResult::Impassable,
+                            Err(_err) => MultiRoomCostResult::Impassable
                         }
                     } else {
                         MultiRoomCostResult::Impassable
