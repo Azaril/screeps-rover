@@ -120,19 +120,19 @@ impl CostMatrixCache {
 
         if configuration.structures {
             if let Some(structures) = room.get_structures() {
-                structures.apply_to(&mut *cost_matrix);
+                structures.apply_to(cost_matrix);
             }
         }
 
         if configuration.friendly_creeps {
             if let Some(friendly_creeps) = room.get_friendly_creeps() {
-                friendly_creeps.apply_to(&mut *cost_matrix);
+                friendly_creeps.apply_to(cost_matrix);
             }
         }
 
         if configuration.hostile_creeps {
             if let Some(hostile_creeps) = room.get_hostile_creeps() {
-                hostile_creeps.apply_to(&mut *cost_matrix);
+                hostile_creeps.apply_to(cost_matrix);
             }
         }
 

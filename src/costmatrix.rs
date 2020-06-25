@@ -4,7 +4,7 @@ use serde::*;
 use std::collections::HashMap;
 
 pub trait CostMatrixApply {
-    fn apply_to<T>(&self, target: T)
+    fn apply_to<T>(&self, target: &mut T)
     where
         T: CostMatrixSet;
 }
@@ -39,7 +39,7 @@ impl CostMatrixRead for SparseCostMatrix {
 }
 
 impl CostMatrixApply for SparseCostMatrix {
-    fn apply_to<T>(&self, target: T)
+    fn apply_to<T>(&self, target: &mut T)
     where
         T: CostMatrixSet,
     {
@@ -66,7 +66,7 @@ impl CostMatrixWrite for LinearCostMatrix {
 }
 
 impl CostMatrixApply for LinearCostMatrix {
-    fn apply_to<T>(&self, target: T)
+    fn apply_to<T>(&self, target: &mut T)
     where
         T: CostMatrixSet,
     {
