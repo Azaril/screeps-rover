@@ -1,6 +1,7 @@
 use screeps::*;
 use super::costmatrixsystem::*;
 
+#[derive(Copy, Clone)]
 pub struct RoomOptions {
     allow_hostile: bool,
 }

@@ -41,6 +41,7 @@ pub trait CostMatrixStorage {
     fn set_cache(&mut self, segment: u32, data: &CostMatrixCache) -> Result<(), String>;
 }
 
+#[derive(Copy, Clone)]
 pub struct CostMatrixOptions {
     pub structures: bool,
     pub friendly_creeps: bool,
@@ -171,7 +172,12 @@ impl<'a> CostMatrixRoomAccessor<'a> {
 
             for structure in structures.iter() {
                 let cost = match structure {
-                    Structure::Rampart(_) | Structure::Road(_) => None,
+                    Structure::Rampart(r) => if r.my() {
+                        None
+                    } else {
+                        Some(u8::MAX)
+                    },
+                    Structure::Road(_) => None,
                     Structure::Container(_) => Some(2),
                     _ => Some(u8::MAX),
                 };

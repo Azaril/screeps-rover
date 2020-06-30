@@ -157,7 +157,7 @@ where
         &mut self,
         external: &mut S,
         entity: Handle,
-        mut request: MovementRequest,
+        request: MovementRequest,
     ) -> Result<(), MovementError>
     where
         S: MovementSystemExternal<Handle>,
@@ -180,30 +180,22 @@ where
         let generate_path = {
             let creep_data = external.get_creep_movement_data(entity)?;
 
-            let path_invalid = if let Some(path_data) = &creep_data.path_data {
-                if path_data.destination != request.destination || path_data.range != request.range || path_data.time > self.reuse_path_length {
-
-                    //
-                    // Ensure that creep is on start of path (didn't move) or on the next path point (did move).
-                    //
-
+            if let Some(path_data) = &creep_data.path_data {
+                let path_valid = 
+                    path_data.destination == request.destination &&
+                    path_data.range == request.range &&
                     path_data
                         .path
                         .iter()
                         .take(2)
-                        .any(|p| *p == creep_pos)
-                } else {
-                    false
-                }
-            } else {
-                true
-            };
+                        .any(|p| *p == creep_pos);
 
-            if path_invalid {
-                creep_data.path_data = None;
+                if !path_valid || path_data.time > self.reuse_path_length {
+                    creep_data.path_data = None
+                }
             }
 
-            path_invalid
+            creep_data.path_data.is_none()
         };
 
         //
@@ -213,82 +205,36 @@ where
         if request.destination == creep_pos {
             return Ok(());
         }
+
+        //
+        // Generate path if required.
+        //
         
         let creep_room_name = creep_pos.room_name();        
 
-        if generate_path {
-            let room_options = request.room_options.take().unwrap_or_default();
-    
-            let destination_room = request.destination.room_name();
-    
-            let room_path = game::map::find_route_with_callback(
-                creep_room_name,
-                request.destination.room_name(),
-                |to_room_name, from_room_name| {
-                        external
-                            .get_room_cost(from_room_name, to_room_name, &room_options)
-                            .unwrap_or(f64::INFINITY)
-                },
-            )
-            .map_err(|e| format!("Could not find path between rooms: {:?}", e))?;
-    
-            let room_names: HashSet<_> = room_path
-                .iter()
-                .map(|step| step.room)
-                .chain(std::iter::once(creep_room_name))
-                .chain(std::iter::once(destination_room))
-                .collect();
-    
-            let cost_matrix_options = request.cost_matrix_options.unwrap_or_default();
-    
-            let cost_matrix_system = &mut self.cost_matrix_system;
-    
-            let max_ops = room_names.len() as u32 * 2000;
+        let new_data = if generate_path {
+            let path_points = self.generate_path(external, &request, &creep)?;
 
-            let search_options = SearchOptions::new()
-            .max_ops(max_ops)
-            .room_callback(|room_name: RoomName| -> MultiRoomCostResult {
-                if room_names.contains(&room_name) {
-                    let mut cost_matrix = CostMatrix::default();
-
-                    match cost_matrix_system.apply_cost_matrix(
-                        room_name,
-                        &mut cost_matrix,
-                        &cost_matrix_options,
-                    ) {
-                        Ok(()) => cost_matrix.into(),
-                        Err(_err) => MultiRoomCostResult::Impassable
-                    }
-                } else {
-                    MultiRoomCostResult::Impassable
-                }
-            });
-
-            let search_result = pathfinder::search(&creep_pos, &request.destination, request.range, search_options);
-
-            if search_result.incomplete {
-                //TODO: Increment stuck, handle stuck?
-                return Err("Unable to generate path".to_owned());
-            }
-
-            let path_points = search_result.load_local_path();
-
-            let creep_data = external.get_creep_movement_data(entity)?;
-
-            creep_data.path_data = Some(CreepPathData {
+            Some(CreepPathData {
                 destination: request.destination,
                 range: request.range,
                 path: path_points,
                 time: 0,
                 stuck: 0
-            });
-        }
+            })
+        } else {
+            None
+        };
 
         //
         // Path is generated at this point - run movement logic.
         //
 
         let creep_data = external.get_creep_movement_data(entity)?;
+
+        if new_data.is_some() {
+            creep_data.path_data = new_data;
+        }
 
         let path_data = creep_data.path_data.as_mut().ok_or("Expected path data")?;
         let path = &mut path_data.path;
@@ -304,9 +250,9 @@ where
 
             let points = path
                 .iter()
-                .filter(|p| p.room_name() == creep_room_name)
+                .take_while(|p| p.room_name() == creep_room_name)
                 .map(|p| (p.x() as f32, p.y() as f32))
-                .collect();
+                .collect::<Vec<_>>();
 
             visual.poly(points, Some(visualization));
         }
@@ -320,24 +266,28 @@ where
             .take(2)
             .enumerate()
             .find(|(_, p)| **p == creep_pos)
-            .map(|(index, _)| index);
+            .map(|(index, _)| index)
+            .ok_or("Expected current position in path")?;
 
-        let next_index = current_index.map(|i| i + 1).unwrap_or(0);
+        let moved = current_index > 0;
 
-        let next_pos = path.get(next_index).cloned().ok_or("Expected path")?;
-
-        if let Some(current_index) = current_index {
-            path.drain(..=current_index);
+        path.drain(..current_index);
+        
+        if path.len() == 1 {
+            return Ok(());
         }
 
         //TODO: This should go at the start of the function once the path has been validated as good to prevent losing state on repath.
-        if path_data.time > 0 && next_index == 0 {
-            log::info!("Stuck!");
-
+        if path_data.time > 0 && !moved {
             path_data.stuck += 1;
         }
 
         path_data.time += 1;
+
+        let next_pos = path
+            .get(1)
+            .cloned()
+            .ok_or("Expected destination step")?;
 
         //TODO: This direction is reversed due to a bug in screeps-game-api which reverses the direction calculation.
         let direction = next_pos.get_direction_to(&creep_pos).ok_or("Expected movement direction")?;
@@ -346,5 +296,80 @@ where
             ReturnCode::Ok => Ok(()),
             err => Err(format!("Movement error: {:?}", err))
         }
+    }
+
+    fn generate_path<S>(
+        &mut self,
+        external: &mut S,
+        request: &MovementRequest,
+        creep: &Creep
+    ) -> Result<Vec<Position>, MovementError>
+    where
+        S: MovementSystemExternal<Handle>, {
+        let creep_pos = creep.pos();
+        let creep_room_name = creep_pos.room_name();
+
+        let room_options = request.room_options.unwrap_or_default();
+
+        let destination_room = request.destination.room_name();
+
+        let room_path = game::map::find_route_with_callback(
+            creep_room_name,
+            request.destination.room_name(),
+            |to_room_name, from_room_name| {
+                    external
+                        .get_room_cost(from_room_name, to_room_name, &room_options)
+                        .unwrap_or(f64::INFINITY)
+            },
+        )
+        .map_err(|e| format!("Could not find path between rooms: {:?}", e))?;
+
+        let room_names: HashSet<_> = room_path
+            .iter()
+            .map(|step| step.room)
+            .chain(std::iter::once(creep_room_name))
+            .chain(std::iter::once(destination_room))
+            .collect();
+
+        let cost_matrix_options = request.cost_matrix_options.unwrap_or_default();
+
+        let cost_matrix_system = &mut self.cost_matrix_system;
+
+        let max_ops = room_names.len() as u32 * 2000;
+
+        let search_options = SearchOptions::new()
+            .max_ops(max_ops)
+            .room_callback(|room_name: RoomName| -> MultiRoomCostResult {
+                if room_names.contains(&room_name) {
+                    let mut cost_matrix = CostMatrix::default();
+
+                    match cost_matrix_system.apply_cost_matrix(
+                        room_name,
+                        &mut cost_matrix,
+                        &cost_matrix_options,
+                    ) {
+                        Ok(()) => cost_matrix.into(),
+                        Err(_err) => {
+                            //TODO: Surface error?
+                            MultiRoomCostResult::Impassable
+                        }
+                    }
+                } else {
+                    MultiRoomCostResult::Impassable
+                }
+            });
+
+        let search_result = pathfinder::search(&creep_pos, &request.destination, request.range, search_options);
+
+        if search_result.incomplete {
+            //TODO: Increment stuck, handle stuck? Increase number of ops?
+            return Err("Unable to generate path".to_owned());
+        }
+
+        let mut path_points = search_result.load_local_path();
+
+        path_points.insert(0, creep_pos);
+
+        Ok(path_points)
     }
 }
