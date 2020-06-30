@@ -280,6 +280,8 @@ where
         //TODO: This should go at the start of the function once the path has been validated as good to prevent losing state on repath.
         if path_data.time > 0 && !moved {
             path_data.stuck += 1;
+        } else {
+            path_data.stuck = 0;
         }
 
         path_data.time += 1;
