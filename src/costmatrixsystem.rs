@@ -41,10 +41,20 @@ pub trait CostMatrixStorage {
     fn set_cache(&mut self, segment: u32, data: &CostMatrixCache) -> Result<(), String>;
 }
 
-pub struct CostMatrixConfiguration {
+pub struct CostMatrixOptions {
     pub structures: bool,
     pub friendly_creeps: bool,
     pub hostile_creeps: bool,
+}
+
+impl Default for CostMatrixOptions {
+    fn default() -> Self {
+        CostMatrixOptions {
+            structures: true,
+            friendly_creeps: true,
+            hostile_creeps: true,
+        }
+    }
 }
 
 pub struct CostMatrixSystem {
@@ -76,11 +86,11 @@ impl CostMatrixSystem {
         &mut self,
         room_name: RoomName,
         cost_matrix: &mut CostMatrix,
-        configuration: &CostMatrixConfiguration,
+        options: &CostMatrixOptions,
     ) -> Result<(), String> {
         let cache = self.get_cache();
 
-        cache.apply_cost_matrix(room_name, cost_matrix, configuration)
+        cache.apply_cost_matrix(room_name, cost_matrix, options)
     }
 
     fn get_cache(&mut self) -> &mut CostMatrixCache {
@@ -114,23 +124,23 @@ impl CostMatrixCache {
         &mut self,
         room_name: RoomName,
         cost_matrix: &mut CostMatrix,
-        configuration: &CostMatrixConfiguration,
+        options: &CostMatrixOptions,
     ) -> Result<(), String> {
         let mut room = self.get_room(room_name);
 
-        if configuration.structures {
+        if options.structures {
             if let Some(structures) = room.get_structures() {
                 structures.apply_to(cost_matrix);
             }
         }
 
-        if configuration.friendly_creeps {
+        if options.friendly_creeps {
             if let Some(friendly_creeps) = room.get_friendly_creeps() {
                 friendly_creeps.apply_to(cost_matrix);
             }
         }
 
-        if configuration.hostile_creeps {
+        if options.hostile_creeps {
             if let Some(hostile_creeps) = room.get_hostile_creeps() {
                 hostile_creeps.apply_to(cost_matrix);
             }

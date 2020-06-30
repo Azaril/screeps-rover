@@ -1,4 +1,5 @@
 use screeps::*;
+use super::costmatrixsystem::*;
 
 pub struct RoomOptions {
     allow_hostile: bool,
@@ -14,6 +15,7 @@ pub struct MovementRequest {
     pub(crate) destination: RoomPosition,
     pub(crate) range: u32,
     pub(crate) room_options: Option<RoomOptions>,
+    pub(crate) cost_matrix_options: Option<CostMatrixOptions>,
     pub(crate) visualization: Option<PolyStyle>,
 }
 
@@ -31,6 +33,7 @@ impl MovementRequest {
             destination,
             range: 0,
             room_options: None,
+            cost_matrix_options: None,
             visualization: None,
         }
     }
@@ -55,6 +58,12 @@ impl<'a> MovementRequestBuilder<'a> {
 
     pub fn room_options(&mut self, options: RoomOptions) -> &mut Self {
         self.request.room_options = Some(options);
+
+        self
+    }
+
+    pub fn cost_matrix_options(&mut self, options: CostMatrixOptions) -> &mut Self {
+        self.request.cost_matrix_options = Some(options);
 
         self
     }
