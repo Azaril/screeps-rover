@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::hash::Hash;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CreepPathData {
     destination: RoomPosition,
     range: u32,
@@ -18,7 +18,7 @@ pub struct CreepPathData {
     stuck: u32,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct CreepMovementData {
     path_data: Option<CreepPathData>
 }
