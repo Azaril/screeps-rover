@@ -12,8 +12,14 @@ pub struct CostMatrixTypeCache<T> {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct StuctureCostMatrixCache {
+    roads: LinearCostMatrix,
+    other: LinearCostMatrix,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct CostMatrixRoomEntry {
-    structures: Option<CostMatrixTypeCache<LinearCostMatrix>>,
+    structures: Option<CostMatrixTypeCache<StuctureCostMatrixCache>>,
     #[serde(skip)]
     friendly_creeps: Option<CostMatrixTypeCache<LinearCostMatrix>>,
     #[serde(skip)]
@@ -46,6 +52,9 @@ pub struct CostMatrixOptions {
     pub structures: bool,
     pub friendly_creeps: bool,
     pub hostile_creeps: bool,
+    pub road_cost: u8,
+    pub plains_cost: u8,
+    pub swamp_cost: u8
 }
 
 impl Default for CostMatrixOptions {
@@ -54,6 +63,9 @@ impl Default for CostMatrixOptions {
             structures: true,
             friendly_creeps: true,
             hostile_creeps: true,
+            road_cost: 1,
+            plains_cost: 2,
+            swamp_cost: 10
         }
     }
 }
@@ -131,7 +143,8 @@ impl CostMatrixCache {
 
         if options.structures {
             if let Some(structures) = room.get_structures() {
-                structures.apply_to(cost_matrix);
+                structures.roads.apply_to_transformed(cost_matrix, |_| options.road_cost);
+                structures.other.apply_to(cost_matrix);
             }
         }
 
@@ -157,7 +170,7 @@ pub struct CostMatrixRoomAccessor<'a> {
 }
 
 impl<'a> CostMatrixRoomAccessor<'a> {
-    pub fn get_structures(&mut self) -> Option<&LinearCostMatrix> {
+    pub fn get_structures(&mut self) -> Option<&StuctureCostMatrixCache> {
         let room_name = self.room_name;
 
         let expiration = move |data: &CostMatrixTypeCache<_>| {
@@ -166,23 +179,26 @@ impl<'a> CostMatrixRoomAccessor<'a> {
         let filler = move || {
             let room = game::rooms::get(room_name)?;
 
-            let mut matrix = LinearCostMatrix::new();
+            let mut roads = LinearCostMatrix::new();
+            let mut other = LinearCostMatrix::new();
 
             let structures = room.find(find::STRUCTURES);
 
             for structure in structures.iter() {
-                let cost = match structure {
+                let res = match structure {
                     Structure::Rampart(r) => if r.my() {
                         None
                     } else {
-                        Some(u8::MAX)
+                        Some((u8::MAX, &mut other))
                     },
-                    Structure::Road(_) => None,
-                    Structure::Container(_) => Some(2),
-                    _ => Some(u8::MAX),
+                    Structure::Road(_) => {
+                        Some((1, &mut roads))
+                    }
+                    Structure::Container(_) => Some((2, &mut other)),
+                    _ => Some((u8::MAX, &mut other)),
                 };
 
-                if let Some(cost) = cost {
+                if let Some((cost, matrix)) = res {
                     let pos = structure.pos();
 
                     matrix.set(pos.x() as u8, pos.y() as u8, cost);
@@ -191,7 +207,10 @@ impl<'a> CostMatrixRoomAccessor<'a> {
 
             let entry = CostMatrixTypeCache {
                 last_updated: game::time(),
-                data: matrix,
+                data: StuctureCostMatrixCache {
+                    roads,
+                    other
+                }
             };
 
             Some(entry)

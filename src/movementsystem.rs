@@ -339,6 +339,8 @@ where
 
         let search_options = SearchOptions::new()
             .max_ops(max_ops)
+            .plain_cost(cost_matrix_options.plains_cost)
+            .swamp_cost(cost_matrix_options.swamp_cost)
             .room_callback(|room_name: RoomName| -> MultiRoomCostResult {
                 if room_names.contains(&room_name) {
                     let mut cost_matrix = CostMatrix::default();
