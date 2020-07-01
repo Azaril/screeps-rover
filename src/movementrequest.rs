@@ -2,13 +2,36 @@ use screeps::*;
 use super::costmatrixsystem::*;
 
 #[derive(Copy, Clone)]
+pub enum HostileBehavior {
+    Allow,
+    HighCost,
+    Deny
+}
+
+#[derive(Copy, Clone)]
 pub struct RoomOptions {
-    allow_hostile: bool,
+    hostile_behavior: HostileBehavior,
 }
 
 impl RoomOptions {
-    pub fn allow_hostile(&self) -> bool {
-        self.allow_hostile
+    pub fn hostile_behavior(&self) -> HostileBehavior {
+        self.hostile_behavior
+    }
+}
+
+impl RoomOptions {
+    pub fn new(hostile_behavior: HostileBehavior) -> RoomOptions {
+        Self {
+            hostile_behavior
+        }
+    }
+}
+
+impl Default for RoomOptions {
+    fn default() -> Self {
+        RoomOptions {
+            hostile_behavior: HostileBehavior::Deny,
+        }
     }
 }
 
@@ -18,14 +41,6 @@ pub struct MovementRequest {
     pub(crate) room_options: Option<RoomOptions>,
     pub(crate) cost_matrix_options: Option<CostMatrixOptions>,
     pub(crate) visualization: Option<PolyStyle>,
-}
-
-impl Default for RoomOptions {
-    fn default() -> Self {
-        RoomOptions {
-            allow_hostile: false,
-        }
-    }
 }
 
 impl MovementRequest {
