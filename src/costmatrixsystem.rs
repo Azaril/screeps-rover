@@ -54,7 +54,7 @@ pub struct CostMatrixOptions {
     pub hostile_creeps: bool,
     pub road_cost: u8,
     pub plains_cost: u8,
-    pub swamp_cost: u8
+    pub swamp_cost: u8,
 }
 
 impl Default for CostMatrixOptions {
@@ -65,7 +65,7 @@ impl Default for CostMatrixOptions {
             hostile_creeps: true,
             road_cost: 1,
             plains_cost: 2,
-            swamp_cost: 10
+            swamp_cost: 10,
         }
     }
 }
@@ -143,7 +143,9 @@ impl CostMatrixCache {
 
         if options.structures {
             if let Some(structures) = room.get_structures() {
-                structures.roads.apply_to_transformed(cost_matrix, |_| options.road_cost);
+                structures
+                    .roads
+                    .apply_to_transformed(cost_matrix, |_| options.road_cost);
                 structures.other.apply_to(cost_matrix);
             }
         }
@@ -186,14 +188,14 @@ impl<'a> CostMatrixRoomAccessor<'a> {
 
             for structure in structures.iter() {
                 let res = match structure {
-                    Structure::Rampart(r) => if r.my() {
-                        None
-                    } else {
-                        Some((u8::MAX, &mut other))
-                    },
-                    Structure::Road(_) => {
-                        Some((1, &mut roads))
+                    Structure::Rampart(r) => {
+                        if r.my() {
+                            None
+                        } else {
+                            Some((u8::MAX, &mut other))
+                        }
                     }
+                    Structure::Road(_) => Some((1, &mut roads)),
                     Structure::Container(_) => Some((2, &mut other)),
                     _ => Some((u8::MAX, &mut other)),
                 };
@@ -207,10 +209,7 @@ impl<'a> CostMatrixRoomAccessor<'a> {
 
             let entry = CostMatrixTypeCache {
                 last_updated: game::time(),
-                data: StuctureCostMatrixCache {
-                    roads,
-                    other
-                }
+                data: StuctureCostMatrixCache { roads, other },
             };
 
             Some(entry)

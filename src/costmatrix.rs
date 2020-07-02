@@ -9,9 +9,9 @@ pub trait CostMatrixApply {
         T: CostMatrixSet;
 
     fn apply_to_transformed<T, TF>(&self, target: &mut T, transformer: TF)
-        where
-            T: CostMatrixSet,
-            TF: Fn(u8) -> u8;
+    where
+        T: CostMatrixSet,
+        TF: Fn(u8) -> u8;
 }
 
 pub trait CostMatrixWrite {
@@ -54,14 +54,14 @@ impl CostMatrixApply for SparseCostMatrix {
     fn apply_to_transformed<T, TF>(&self, target: &mut T, transformer: TF)
     where
         T: CostMatrixSet,
-        TF: Fn(u8) -> u8
+        TF: Fn(u8) -> u8,
     {
         target.set_multi(self.data.iter().map(|(location, cost)| {
             let new_cost = transformer(*cost);
 
             (location, new_cost)
         }));
-    }    
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -93,12 +93,12 @@ impl CostMatrixApply for LinearCostMatrix {
     fn apply_to_transformed<T, TF>(&self, target: &mut T, transformer: TF)
     where
         T: CostMatrixSet,
-        TF: Fn(u8) -> u8
+        TF: Fn(u8) -> u8,
     {
         target.set_multi(self.data.iter().map(|(location, cost)| {
             let new_cost = transformer(*cost);
 
             (location, new_cost)
         }));
-    }   
+    }
 }

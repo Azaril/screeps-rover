@@ -1,11 +1,11 @@
-use screeps::*;
 use super::costmatrixsystem::*;
+use screeps::*;
 
 #[derive(Copy, Clone)]
 pub enum HostileBehavior {
     Allow,
     HighCost,
-    Deny
+    Deny,
 }
 
 #[derive(Copy, Clone)]
@@ -21,9 +21,7 @@ impl RoomOptions {
 
 impl RoomOptions {
     pub fn new(hostile_behavior: HostileBehavior) -> RoomOptions {
-        Self {
-            hostile_behavior
-        }
+        Self { hostile_behavior }
     }
 }
 

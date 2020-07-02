@@ -20,7 +20,7 @@ pub struct CreepPathData {
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct CreepMovementData {
-    path_data: Option<CreepPathData>
+    path_data: Option<CreepPathData>,
 }
 
 #[derive(Default)]
@@ -54,7 +54,10 @@ where
 pub trait MovementSystemExternal<Handle> {
     fn get_creep(&self, entity: Handle) -> Result<Creep, MovementError>;
 
-    fn get_creep_movement_data(&mut self, entity: Handle) -> Result<&mut CreepMovementData, MovementError>;
+    fn get_creep_movement_data(
+        &mut self,
+        entity: Handle,
+    ) -> Result<&mut CreepMovementData, MovementError>;
 
     fn get_room_cost(
         &self,
@@ -181,14 +184,9 @@ where
             let creep_data = external.get_creep_movement_data(entity)?;
 
             if let Some(path_data) = &creep_data.path_data {
-                let path_valid = 
-                    path_data.destination == request.destination &&
-                    path_data.range == request.range &&
-                    path_data
-                        .path
-                        .iter()
-                        .take(2)
-                        .any(|p| *p == creep_pos);
+                let path_valid = path_data.destination == request.destination
+                    && path_data.range == request.range
+                    && path_data.path.iter().take(2).any(|p| *p == creep_pos);
 
                 if !path_valid || path_data.time > self.reuse_path_length {
                     creep_data.path_data = None
@@ -209,8 +207,8 @@ where
         //
         // Generate path if required.
         //
-        
-        let creep_room_name = creep_pos.room_name();        
+
+        let creep_room_name = creep_pos.room_name();
 
         let new_data = if generate_path {
             let path_points = self.generate_path(external, &request, &creep)?;
@@ -220,7 +218,7 @@ where
                 range: request.range,
                 path: path_points,
                 time: 0,
-                stuck: 0
+                stuck: 0,
             })
         } else {
             None
@@ -243,7 +241,9 @@ where
         // Visualize
         //
 
-        let visualization = request.visualization.or_else(|| self.default_visualization_style.clone());
+        let visualization = request
+            .visualization
+            .or_else(|| self.default_visualization_style.clone());
 
         if let Some(visualization) = visualization {
             let visual = RoomVisual::new(Some(creep_room_name));
@@ -272,7 +272,7 @@ where
         let moved = current_index > 0;
 
         path.drain(..current_index);
-        
+
         if path.len() == 1 {
             return Ok(());
         }
@@ -286,17 +286,16 @@ where
 
         path_data.time += 1;
 
-        let next_pos = path
-            .get(1)
-            .cloned()
-            .ok_or("Expected destination step")?;
+        let next_pos = path.get(1).cloned().ok_or("Expected destination step")?;
 
         //TODO: This direction is reversed due to a bug in screeps-game-api which reverses the direction calculation.
-        let direction = next_pos.get_direction_to(&creep_pos).ok_or("Expected movement direction")?;
+        let direction = next_pos
+            .get_direction_to(&creep_pos)
+            .ok_or("Expected movement direction")?;
 
         match creep.move_direction(direction) {
             ReturnCode::Ok => Ok(()),
-            err => Err(format!("Movement error: {:?}", err))
+            err => Err(format!("Movement error: {:?}", err)),
         }
     }
 
@@ -304,10 +303,11 @@ where
         &mut self,
         external: &mut S,
         request: &MovementRequest,
-        creep: &Creep
+        creep: &Creep,
     ) -> Result<Vec<Position>, MovementError>
     where
-        S: MovementSystemExternal<Handle>, {
+        S: MovementSystemExternal<Handle>,
+    {
         let creep_pos = creep.pos();
         let creep_room_name = creep_pos.room_name();
 
@@ -319,9 +319,9 @@ where
             creep_room_name,
             request.destination.room_name(),
             |to_room_name, from_room_name| {
-                    external
-                        .get_room_cost(from_room_name, to_room_name, &room_options)
-                        .unwrap_or(f64::INFINITY)
+                external
+                    .get_room_cost(from_room_name, to_room_name, &room_options)
+                    .unwrap_or(f64::INFINITY)
             },
         )
         .map_err(|e| format!("Could not find path between rooms: {:?}", e))?;
@@ -363,7 +363,12 @@ where
                 }
             });
 
-        let search_result = pathfinder::search(&creep_pos, &request.destination, request.range, search_options);
+        let search_result = pathfinder::search(
+            &creep_pos,
+            &request.destination,
+            request.range,
+            search_options,
+        );
 
         if search_result.incomplete {
             //TODO: Increment stuck, handle stuck? Increase number of ops?
