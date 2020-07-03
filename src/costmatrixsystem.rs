@@ -18,8 +18,19 @@ pub struct StuctureCostMatrixCache {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct ConstructionSiteCostMatrixCache {
+    blocked_construction_sites: LinearCostMatrix,
+    friendly_inactive_construction_sites: LinearCostMatrix,
+    friendly_active_construction_sites: LinearCostMatrix,
+    hostile_inactive_construction_sites: LinearCostMatrix,    
+    hostile_active_construction_sites: LinearCostMatrix,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct CostMatrixRoomEntry {
     structures: Option<CostMatrixTypeCache<StuctureCostMatrixCache>>,
+    #[serde(skip)]
+    construction_sites: Option<CostMatrixTypeCache<ConstructionSiteCostMatrixCache>>,    
     #[serde(skip)]
     friendly_creeps: Option<CostMatrixTypeCache<LinearCostMatrix>>,
     #[serde(skip)]
@@ -30,6 +41,7 @@ impl CostMatrixRoomEntry {
     pub fn new() -> CostMatrixRoomEntry {
         CostMatrixRoomEntry {
             structures: None,
+            construction_sites: None,
             friendly_creeps: None,
             hostile_creeps: None,
         }
@@ -52,9 +64,14 @@ pub struct CostMatrixOptions {
     pub structures: bool,
     pub friendly_creeps: bool,
     pub hostile_creeps: bool,
+    pub construction_sites: bool,
     pub road_cost: u8,
     pub plains_cost: u8,
     pub swamp_cost: u8,
+    pub friendly_inactive_construction_site_cost: Option<u8>,
+    pub friendly_active_construction_site_cost: Option<u8>,
+    pub hostile_inactive_construction_site_cost: Option<u8>,    
+    pub hostile_active_construction_site_cost: Option<u8>,
 }
 
 impl Default for CostMatrixOptions {
@@ -63,9 +80,14 @@ impl Default for CostMatrixOptions {
             structures: true,
             friendly_creeps: true,
             hostile_creeps: true,
+            construction_sites: true,
             road_cost: 1,
             plains_cost: 2,
             swamp_cost: 10,
+            friendly_inactive_construction_site_cost: None,
+            friendly_active_construction_site_cost: Some(3),
+            hostile_inactive_construction_site_cost: Some(2),
+            hostile_active_construction_site_cost: Some(1),
         }
     }
 }
@@ -146,7 +168,28 @@ impl CostMatrixCache {
                 structures
                     .roads
                     .apply_to_transformed(cost_matrix, |_| options.road_cost);
+
                 structures.other.apply_to(cost_matrix);
+            }
+        }
+
+        if options.construction_sites {
+            if let Some(construction_sites) = room.get_construction_sites() {
+                construction_sites.blocked_construction_sites.apply_to(cost_matrix);
+
+                let applicators = [
+                    (options.friendly_inactive_construction_site_cost, &construction_sites.friendly_inactive_construction_sites),
+                    (options.friendly_active_construction_site_cost, &construction_sites.friendly_active_construction_sites),
+                    (options.hostile_inactive_construction_site_cost, &construction_sites.hostile_inactive_construction_sites),
+                    (options.hostile_active_construction_site_cost, &construction_sites.hostile_active_construction_sites),
+                ];
+
+                //TODO: Rework API to generate an iterator to batch the full set of cost matrix modifies.
+                for (cost, source_matrix) in &applicators {
+                    if let Some(cost) = cost {
+                        source_matrix.apply_to_transformed(cost_matrix, |_| *cost);
+                    }
+                }        
             }
         }
 
@@ -189,7 +232,7 @@ impl<'a> CostMatrixRoomAccessor<'a> {
             for structure in structures.iter() {
                 let res = match structure {
                     Structure::Rampart(r) => {
-                        if r.my() {
+                        if r.my() || r.is_public() {
                             None
                         } else {
                             Some((u8::MAX, &mut other))
@@ -217,6 +260,76 @@ impl<'a> CostMatrixRoomAccessor<'a> {
 
         self.entry
             .structures
+            .maybe_access(expiration, filler)
+            .get()
+            .map(|d| &d.data)
+    }
+
+    pub fn get_construction_sites(&mut self) -> Option<&ConstructionSiteCostMatrixCache> {
+        let room_name = self.room_name;
+        let expiration = |data: &CostMatrixTypeCache<_>| game::time() - data.last_updated > 0 && game::rooms::get(room_name).is_some();
+        let filler = move || {
+            let room = game::rooms::get(room_name)?;
+
+            let mut blocked_construction_sites = LinearCostMatrix::new();
+
+            let mut friendly_inactive_construction_sites = LinearCostMatrix::new();
+            let mut friendly_active_construction_sites = LinearCostMatrix::new();
+
+            let mut hostile_inactive_construction_sites = LinearCostMatrix::new();
+            let mut hostile_active_construction_sites = LinearCostMatrix::new();            
+
+            for construction_site in room.find(find::MY_CONSTRUCTION_SITES).iter() {
+                let pos = construction_site.pos();
+
+                let walkable = match construction_site.structure_type() {
+                    StructureType::Container => true,
+                    StructureType::Road => true,
+                    StructureType::Rampart => true,
+                    _ => false
+                };
+
+                if !walkable {
+                    blocked_construction_sites.set(pos.x() as u8, pos.y() as u8, u8::MAX);
+                } else if construction_site.progress() > 0 {
+                    friendly_active_construction_sites.set(pos.x() as u8, pos.y() as u8, 1);
+                } else {
+                    friendly_inactive_construction_sites.set(pos.x() as u8, pos.y() as u8, 1);
+                }
+            }
+
+            let safe_mode = room.controller().and_then(|c| c.safe_mode()).unwrap_or(0) > 0;
+
+            for construction_site in room.find(find::HOSTILE_CONSTRUCTION_SITES).iter() {
+                let pos = construction_site.pos();
+
+                let walkable = !safe_mode;
+
+                if !walkable {
+                    blocked_construction_sites.set(pos.x() as u8, pos.y() as u8, u8::MAX);
+                } else if construction_site.progress() > 0 {
+                    hostile_active_construction_sites.set(pos.x() as u8, pos.y() as u8, 1);
+                } else {
+                    hostile_inactive_construction_sites.set(pos.x() as u8, pos.y() as u8, 1);
+                }
+            }
+
+            let entry = CostMatrixTypeCache {
+                last_updated: game::time(),
+                data: ConstructionSiteCostMatrixCache {
+                    blocked_construction_sites,
+                    friendly_inactive_construction_sites,
+                    friendly_active_construction_sites,
+                    hostile_inactive_construction_sites,
+                    hostile_active_construction_sites
+                },
+            };
+
+            Some(entry)
+        };
+
+        self.entry
+            .construction_sites
             .maybe_access(expiration, filler)
             .get()
             .map(|d| &d.data)
