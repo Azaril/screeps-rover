@@ -78,7 +78,7 @@ impl Default for CostMatrixOptions {
     fn default() -> Self {
         CostMatrixOptions {
             structures: true,
-            friendly_creeps: true,
+            friendly_creeps: false,
             hostile_creeps: true,
             construction_sites: true,
             road_cost: 1,

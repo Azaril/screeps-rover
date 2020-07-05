@@ -167,34 +167,7 @@ where
     {
         let creep = external.get_creep(entity)?;
         let creep_pos = creep.pos();
-
-        if creep.fatigue() > 0 {
-            return Ok(());
-        }
-
-        if creep.spawning() {
-            return Ok(());
-        }
-
-        //
-        // Invalidate path if parameters have changed.
-        //
-
-        let generate_path = {
-            let creep_data = external.get_creep_movement_data(entity)?;
-
-            if let Some(path_data) = &creep_data.path_data {
-                let path_valid = path_data.destination == request.destination
-                    && path_data.range == request.range
-                    && path_data.path.iter().take(2).any(|p| *p == creep_pos);
-
-                if !path_valid || path_data.time > self.reuse_path_length {
-                    creep_data.path_data = None
-                }
-            }
-
-            creep_data.path_data.is_none()
-        };
+        let creep_room_name = creep_pos.room_name();
 
         //
         // Don't move if parameters are already met.
@@ -204,99 +177,149 @@ where
             return Ok(());
         }
 
-        //
-        // Generate path if required.
-        //
+        if creep.fatigue() == 0 && !creep.spawning() {
+            //
+            // Invalidate path if parameters have changed.
+            //
 
-        let creep_room_name = creep_pos.room_name();
+            let has_path = {
+                let creep_data = external.get_creep_movement_data(entity)?;
 
-        let new_data = if generate_path {
-            let path_points = self.generate_path(external, &request, &creep)?;
+                if let Some(path_data) = &creep_data.path_data {
+                    let path_valid = path_data.destination == request.destination
+                        && path_data.range == request.range
+                        && path_data.path.iter().take(2).any(|p| *p == creep_pos);
 
-            Some(CreepPathData {
-                destination: request.destination,
-                range: request.range,
-                path: path_points,
-                time: 0,
-                stuck: 0,
-            })
-        } else {
-            None
-        };
+                    if !path_valid {
+                        creep_data.path_data = None
+                    }
+                }
 
-        //
-        // Path is generated at this point - run movement logic.
-        //
+                creep_data.path_data.is_some()
+            };
 
-        let creep_data = external.get_creep_movement_data(entity)?;
+            //
+            // Don't move if parameters are already met.
+            //
 
-        if new_data.is_some() {
-            creep_data.path_data = new_data;
+            if request.destination == creep_pos {
+                return Ok(());
+            }
+
+            //
+            // Calculate if creep moved since last tick.
+            //
+
+            let move_result = {
+                let creep_data = external.get_creep_movement_data(entity)?;
+                
+                if let Some(path_data) = creep_data.path_data.as_mut() {
+                    path_data.time += 1;
+
+                    let path = &mut path_data.path;
+
+                    let current_index = path
+                        .iter()
+                        .take(2)
+                        .enumerate()
+                        .find(|(_, p)| **p == creep_pos)
+                        .map(|(index, _)| index)
+                        .ok_or("Expected current position in path")?;
+
+                    let moved = current_index > 0;
+
+                    path.drain(..current_index);
+
+                    if path.len() == 1 {
+                        return Ok(());
+                    }
+
+                    if moved {
+                        path_data.stuck = 0;
+                    } else {
+                        path_data.stuck += 1;
+                    }
+
+                    Some((path_data.time, path_data.stuck))
+                } else {
+                    None
+                }
+            };
+
+            let path_expired = move_result.map(|(path_time, _)| path_time >= self.reuse_path_length).unwrap_or(false);
+            let stuck = move_result.map(|(_, stuck_count)| stuck_count > 1).unwrap_or(false);
+
+            //
+            // Generate path if required.
+            //
+
+            let new_data = if !has_path || path_expired || stuck {
+                let path_points = self.generate_path(external, &request, &creep, stuck)?;
+
+                Some(CreepPathData {
+                    destination: request.destination,
+                    range: request.range,
+                    path: path_points,
+                    time: 0,
+                    stuck: 0,
+                })
+            } else {
+                None
+            };
+
+            //
+            // Path is generated at this point - run movement logic.
+            //
+
+            let creep_data = external.get_creep_movement_data(entity)?;
+
+            if new_data.is_some() {
+                creep_data.path_data = new_data;
+            }
+
+            let path_data = creep_data.path_data.as_mut().ok_or("Expected path data")?;
+            let path = &mut path_data.path;
+
+            let next_pos = path.get(1).cloned().ok_or("Expected destination step")?;
+
+            //TODO: This direction is reversed due to a bug in screeps-game-api which reverses the direction calculation.
+            let direction = next_pos
+                .get_direction_to(&creep_pos)
+                .ok_or("Expected movement direction")?;
+
+            match creep.move_direction(direction) {
+                ReturnCode::Ok => Ok(()),
+                err => Err(format!("Movement error: {:?}", err)),
+            }?;
         }
 
-        let path_data = creep_data.path_data.as_mut().ok_or("Expected path data")?;
-        let path = &mut path_data.path;
+        {
+            let creep_data = external.get_creep_movement_data(entity)?;
+            let path_data = creep_data.path_data.as_mut().ok_or("Expected path data")?;
+            let path = &mut path_data.path;
 
-        //
-        // Visualize
-        //
+            //
+            // Visualize
+            //
 
-        let visualization = request
-            .visualization
-            .or_else(|| self.default_visualization_style.clone());
+            let visualization = request
+                .visualization
+                .or_else(|| self.default_visualization_style.clone());
 
-        if let Some(visualization) = visualization {
-            let visual = RoomVisual::new(Some(creep_room_name));
+            if let Some(visualization) = visualization {
+                let visual = RoomVisual::new(Some(creep_room_name));
 
-            let points = path
-                .iter()
-                .take_while(|p| p.room_name() == creep_room_name)
-                .map(|p| (p.x() as f32, p.y() as f32))
-                .collect::<Vec<_>>();
+                let points = path
+                    .iter()
+                    .take_while(|p| p.room_name() == creep_room_name)
+                    .map(|p| (p.x() as f32, p.y() as f32))
+                    .collect::<Vec<_>>();
 
-            visual.poly(points, Some(visualization));
+                visual.poly(points, Some(visualization));
+            }
         }
 
-        //
-        // Move!
-        //
-
-        let current_index = path
-            .iter()
-            .take(2)
-            .enumerate()
-            .find(|(_, p)| **p == creep_pos)
-            .map(|(index, _)| index)
-            .ok_or("Expected current position in path")?;
-
-        let moved = current_index > 0;
-
-        path.drain(..current_index);
-
-        if path.len() == 1 {
-            return Ok(());
-        }
-
-        //TODO: This should go at the start of the function once the path has been validated as good to prevent losing state on repath.
-        if path_data.time > 0 && !moved {
-            path_data.stuck += 1;
-        } else {
-            path_data.stuck = 0;
-        }
-
-        path_data.time += 1;
-
-        let next_pos = path.get(1).cloned().ok_or("Expected destination step")?;
-
-        //TODO: This direction is reversed due to a bug in screeps-game-api which reverses the direction calculation.
-        let direction = next_pos
-            .get_direction_to(&creep_pos)
-            .ok_or("Expected movement direction")?;
-
-        match creep.move_direction(direction) {
-            ReturnCode::Ok => Ok(()),
-            err => Err(format!("Movement error: {:?}", err)),
-        }
+        Ok(())
     }
 
     fn generate_path<S>(
@@ -304,6 +327,7 @@ where
         external: &mut S,
         request: &MovementRequest,
         creep: &Creep,
+        is_stuck: bool
     ) -> Result<Vec<Position>, MovementError>
     where
         S: MovementSystemExternal<Handle>,
@@ -333,7 +357,11 @@ where
             .chain(std::iter::once(destination_room))
             .collect();
 
-        let cost_matrix_options = request.cost_matrix_options.unwrap_or_default();
+        let mut cost_matrix_options = request.cost_matrix_options.unwrap_or_default();
+
+        if is_stuck {
+            cost_matrix_options.friendly_creeps = true;
+        }
 
         let cost_matrix_system = &mut self.cost_matrix_system;
 
