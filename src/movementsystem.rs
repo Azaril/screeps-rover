@@ -199,14 +199,6 @@ where
             };
 
             //
-            // Don't move if parameters are already met.
-            //
-
-            if request.destination == creep_pos {
-                return Ok(());
-            }
-
-            //
             // Calculate if creep moved since last tick.
             //
 
