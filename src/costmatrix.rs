@@ -1,5 +1,5 @@
 use crate::location::*;
-use screeps::pathfinder::*;
+use screeps::*;
 use serde::*;
 use std::collections::HashMap;
 

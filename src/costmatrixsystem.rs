@@ -1,6 +1,5 @@
 use super::costmatrix::*;
 use super::constants::*;
-use screeps::pathfinder::CostMatrix;
 use screeps::*;
 use screeps_cache::*;
 use serde::*;

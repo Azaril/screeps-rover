@@ -274,9 +274,8 @@ where
 
             let next_pos = path.get(1).cloned().ok_or("Expected destination step")?;
 
-            //TODO: This direction is reversed due to a bug in screeps-game-api which reverses the direction calculation.
-            let direction = next_pos
-                .get_direction_to(&creep_pos)
+            let direction = creep_pos 
+                .get_direction_to(&next_pos)
                 .ok_or("Expected movement direction")?;
 
             match creep.move_direction(direction) {
@@ -383,12 +382,12 @@ where
                 }
             });
 
-        let search_result = pathfinder::search(
+        let search_result = unsafe { pathfinder::search(
             &creep_pos,
             &request.destination,
             request.range,
             search_options,
-        );
+        ) };
 
         if search_result.incomplete {
             //TODO: Increment stuck, handle stuck? Increase number of ops?

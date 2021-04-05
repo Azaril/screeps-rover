@@ -4,8 +4,11 @@ version = "0.1.0"
 authors = ["William Archbell <william@archbell.com>"]
 edition = "2018"
 
+[lib]
+crate-type = ["cdylib"]
+
 [dependencies]
-screeps-game-api = { version = "0.8" }
+screeps-game-api = { version = "0.10" }
 screeps-cache = { git = "https://github.com/Azaril/screeps-cache" }
 serde = "1.0"
 log = "0.4"
