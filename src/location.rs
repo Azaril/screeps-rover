@@ -1,4 +1,4 @@
-use screeps::pathfinder::*;
+use screeps::*;
 use serde::*;
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]

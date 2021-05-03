@@ -5,14 +5,15 @@ pub fn can_traverse_between_rooms(from: RoomName, to: RoomName) -> bool {
     let from_room_status = game::map::get_room_status(from);
     let to_room_status = game::map::get_room_status(to);
 
-    can_traverse_between_room_status(&from_room_status, &to_room_status)
+    can_traverse_between_room_status(from_room_status.status(), to_room_status.status())
 }
 
-pub fn can_traverse_between_room_status(from: &MapRoomStatus, to: &MapRoomStatus) -> bool {
-    match to.status {
-        game::map::RoomStatus::Normal => from.status == game::map::RoomStatus::Normal,
-        game::map::RoomStatus::Closed => false,
-        game::map::RoomStatus::Novice => from.status == game::map::RoomStatus::Novice,
-        game::map::RoomStatus::Respawn => from.status == game::map::RoomStatus::Respawn,
+pub fn can_traverse_between_room_status(from: RoomStatus, to: RoomStatus) -> bool {
+    match to {
+        RoomStatus::Normal => from == RoomStatus::Normal,
+        RoomStatus::Closed => false,
+        RoomStatus::Novice => from == RoomStatus::Novice,
+        RoomStatus::Respawn => from == RoomStatus::Respawn,
+        _ => false,
     }
 }

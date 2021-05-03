@@ -5,7 +5,7 @@ authors = ["William Archbell <william@archbell.com>"]
 edition = "2018"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 screeps-game-api = { version = "0.10" }
