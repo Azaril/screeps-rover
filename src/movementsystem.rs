@@ -151,7 +151,7 @@ where
             move_options
         };
 
-        match creep.move_to(request.destination, Some(vis_move_options)) {
+        match creep.move_to_with_options(request.destination, Some(vis_move_options)) {
             ReturnCode::Ok => return Ok(()),
             err => return Err(format!("Move error: {:?}", err)),
         }
@@ -167,8 +167,7 @@ where
         S: MovementSystemExternal<Handle>,
     {
         let creep = external.get_creep(entity)?;
-        //TODO: Remove explicit into?
-        let creep_pos: Position = creep.pos().into();
+        let creep_pos: Position = creep.pos();
         let creep_room_name = creep_pos.room_name();
 
         //
@@ -305,7 +304,7 @@ where
                 let points = path
                     .iter()
                     .take_while(|p| p.room_name() == creep_room_name)
-                    .map(|p| (p.x() as f32, p.y() as f32))
+                    .map(|p| (p.x().u8() as f32, p.y().u8() as f32))
                     .collect::<Vec<_>>();
 
                 visual.poly(points, Some(visualization));
@@ -371,7 +370,9 @@ where
                         &mut cost_matrix,
                         &cost_matrix_options,
                     ) {
-                        Ok(()) => MultiRoomCostResult::CostMatrix(cost_matrix),
+                        Ok(()) => {
+                            MultiRoomCostResult::CostMatrix(cost_matrix)
+                        },
                         Err(_err) => {
                             //TODO: Surface error?
                             MultiRoomCostResult::Impassable

@@ -258,7 +258,7 @@ impl<'a> CostMatrixRoomAccessor<'a> {
                 if let Some((cost, matrix)) = res {
                     let pos = structure.pos();
 
-                    matrix.set(pos.x() as u8, pos.y() as u8, cost);
+                    matrix.set(pos.x().into(), pos.y().into(), cost);
                 }
             }
 
@@ -302,11 +302,11 @@ impl<'a> CostMatrixRoomAccessor<'a> {
                 };
 
                 if !walkable {
-                    blocked_construction_sites.set(pos.x() as u8, pos.y() as u8, u8::MAX);
+                    blocked_construction_sites.set(pos.x().into(), pos.y().into(), u8::MAX);
                 } else if construction_site.progress() > 0 {
-                    friendly_active_construction_sites.set(pos.x() as u8, pos.y() as u8, 1);
+                    friendly_active_construction_sites.set(pos.x().into(), pos.y().into(), 1);
                 } else {
-                    friendly_inactive_construction_sites.set(pos.x() as u8, pos.y() as u8, 1);
+                    friendly_inactive_construction_sites.set(pos.x().into(), pos.y().into(), 1);
                 }
             }
 
@@ -318,11 +318,11 @@ impl<'a> CostMatrixRoomAccessor<'a> {
                 let walkable = !safe_mode;
 
                 if !walkable {
-                    blocked_construction_sites.set(pos.x() as u8, pos.y() as u8, u8::MAX);
+                    blocked_construction_sites.set(pos.x().into(), pos.y().into(), u8::MAX);
                 } else if construction_site.progress() > 0 {
-                    hostile_active_construction_sites.set(pos.x() as u8, pos.y() as u8, 1);
+                    hostile_active_construction_sites.set(pos.x().into(), pos.y().into(), 1);
                 } else {
-                    hostile_inactive_construction_sites.set(pos.x() as u8, pos.y() as u8, 1);
+                    hostile_inactive_construction_sites.set(pos.x().into(), pos.y().into(), 1);
                 }
             }
 
@@ -358,13 +358,13 @@ impl<'a> CostMatrixRoomAccessor<'a> {
             for creep in room.find(find::MY_CREEPS).iter() {
                 let pos = creep.pos();
 
-                friendly_creeps.set(pos.x() as u8, pos.y() as u8, u8::MAX);
+                friendly_creeps.set(pos.x().into(), pos.y().into(), u8::MAX);
             }
 
             for power_creep in room.find(find::MY_POWER_CREEPS).iter() {
                 let pos = power_creep.pos();
 
-                friendly_creeps.set(pos.x() as u8, pos.y() as u8, u8::MAX);
+                friendly_creeps.set(pos.x().into(), pos.y().into(), u8::MAX);
             }
 
             let mut hostile_creeps = LinearCostMatrix::new();
@@ -377,13 +377,16 @@ impl<'a> CostMatrixRoomAccessor<'a> {
             for creep in room.find(find::HOSTILE_CREEPS).iter() {
                 let pos = creep.pos();
 
-                hostile_creeps.set(pos.x() as u8, pos.y() as u8, u8::MAX);
+                hostile_creeps.set(pos.x().into(), pos.y().into(), u8::MAX);
 
                 if creep.owner().username() == SOURCE_KEEPER_NAME {
                     let pos = creep.pos();
 
-                    let x = pos.x() as i32;
-                    let y = pos.y() as i32;
+                    let x: u8 = pos.x().into();
+                    let x = x as i32;
+
+                    let y: u8 = pos.y().into();
+                    let y = y as i32;
 
                     //TODO: Add constants for room size? Use FastRoomTerrain?
                     
@@ -408,7 +411,7 @@ impl<'a> CostMatrixRoomAccessor<'a> {
             for power_creep in room.find(find::HOSTILE_POWER_CREEPS).iter() {
                 let pos = power_creep.pos();
 
-                hostile_creeps.set(pos.x() as u8, pos.y() as u8, u8::MAX);
+                hostile_creeps.set(pos.x().into(), pos.y().into(), u8::MAX);
             }
 
             let entry = CostMatrixTypeCache {
