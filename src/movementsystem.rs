@@ -240,14 +240,15 @@ where
             };
 
             let path_expired = move_result.map(|(path_time, _)| path_time >= self.reuse_path_length).unwrap_or(false);
-            let stuck = move_result.map(|(_, stuck_count)| stuck_count > 1).unwrap_or(false);
+            let stuck_count = move_result.map(|(_, stuck_count)| stuck_count).unwrap_or(0);
 
             //
             // Generate path if required.
             //
 
-            let new_data = if !has_path || path_expired || stuck {
-                let path_points = self.generate_path(external, &request, &creep, stuck)?;
+            let new_data = if !has_path || path_expired || stuck_count > 1 {
+                let try_unstuck = stuck_count > 1 && stuck_count % 2 == 0;
+                let path_points = self.generate_path(external, &request, &creep, try_unstuck)?;
 
                 Some(CreepPathData {
                     destination: request.destination,
