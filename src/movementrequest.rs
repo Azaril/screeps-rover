@@ -34,7 +34,7 @@ impl Default for RoomOptions {
 }
 
 pub struct MovementRequest {
-    pub(crate) destination: RoomPosition,
+    pub(crate) destination: Position,
     pub(crate) range: u32,
     pub(crate) room_options: Option<RoomOptions>,
     pub(crate) cost_matrix_options: Option<CostMatrixOptions>,
@@ -42,7 +42,7 @@ pub struct MovementRequest {
 }
 
 impl MovementRequest {
-    pub fn move_to(destination: RoomPosition) -> MovementRequest {
+    pub fn move_to(destination: Position) -> MovementRequest {
         MovementRequest {
             destination,
             range: 0,
@@ -57,9 +57,9 @@ pub struct MovementRequestBuilder<'a> {
     request: &'a mut MovementRequest,
 }
 
-impl<'a> Into<MovementRequestBuilder<'a>> for &'a mut MovementRequest {
-    fn into(self) -> MovementRequestBuilder<'a> {
-        MovementRequestBuilder { request: self }
+impl<'a> From<&'a mut MovementRequest> for MovementRequestBuilder<'a> {
+    fn from(request: &'a mut MovementRequest) -> MovementRequestBuilder<'a> {
+        MovementRequestBuilder { request }
     }
 }
 

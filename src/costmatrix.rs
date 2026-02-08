@@ -1,5 +1,5 @@
 use crate::location::*;
-use screeps::pathfinder::*;
+use screeps::*;
 use serde::*;
 use std::collections::HashMap;
 
@@ -48,7 +48,9 @@ impl CostMatrixApply for SparseCostMatrix {
     where
         T: CostMatrixSet,
     {
-        target.set_multi(self.data.iter());
+        for (location, cost) in self.data.iter() {
+            target.set_xy(location.to_room_xy(), *cost);
+        }
     }
 
     fn apply_to_transformed<T, TF>(&self, target: &mut T, transformer: TF)
@@ -56,11 +58,10 @@ impl CostMatrixApply for SparseCostMatrix {
         T: CostMatrixSet,
         TF: Fn(u8) -> u8,
     {
-        target.set_multi(self.data.iter().map(|(location, cost)| {
+        for (location, cost) in self.data.iter() {
             let new_cost = transformer(*cost);
-
-            (location, new_cost)
-        }));
+            target.set_xy(location.to_room_xy(), new_cost);
+        }
     }
 }
 
@@ -87,7 +88,9 @@ impl CostMatrixApply for LinearCostMatrix {
     where
         T: CostMatrixSet,
     {
-        target.set_multi(self.data.iter());
+        for (location, cost) in self.data.iter() {
+            target.set_xy(location.to_room_xy(), *cost);
+        }
     }
 
     fn apply_to_transformed<T, TF>(&self, target: &mut T, transformer: TF)
@@ -95,10 +98,9 @@ impl CostMatrixApply for LinearCostMatrix {
         T: CostMatrixSet,
         TF: Fn(u8) -> u8,
     {
-        target.set_multi(self.data.iter().map(|(location, cost)| {
+        for (location, cost) in self.data.iter() {
             let new_cost = transformer(*cost);
-
-            (location, new_cost)
-        }));
+            target.set_xy(location.to_room_xy(), new_cost);
+        }
     }
 }

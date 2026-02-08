@@ -2,6 +2,7 @@ use super::costmatrixsystem::*;
 use super::error::*;
 use super::movementrequest::*;
 use super::utility::*;
+use screeps::game::map::FindRouteOptions;
 use screeps::pathfinder::*;
 use screeps::*;
 use serde::*;
@@ -11,7 +12,7 @@ use std::hash::Hash;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CreepPathData {
-    destination: RoomPosition,
+    destination: Position,
     range: u32,
     path: Vec<Position>,
     time: u32,
@@ -42,7 +43,7 @@ where
         }
     }
 
-    pub fn move_to(&mut self, entity: Handle, destination: RoomPosition) -> MovementRequestBuilder {
+    pub fn move_to(&mut self, entity: Handle, destination: Position) -> MovementRequestBuilder<'_> {
         self.requests
             .entry(entity)
             .and_modify(|e| *e = MovementRequest::move_to(destination))
@@ -150,10 +151,10 @@ where
             move_options
         };
 
-        match creep.move_to_with_options(&request.destination, vis_move_options) {
-            ReturnCode::Ok => return Ok(()),
-            err => return Err(format!("Move error: {:?}", err)),
-        }
+        creep.move_to_with_options(request.destination, Some(vis_move_options))
+            .map_err(|e| format!("Move error: {:?}", e))?;
+
+        Ok(())
     }
 
     fn process_request<S>(
@@ -274,15 +275,13 @@ where
 
             let next_pos = path.get(1).cloned().ok_or("Expected destination step")?;
 
-            //TODO: This direction is reversed due to a bug in screeps-game-api which reverses the direction calculation.
-            let direction = next_pos
-                .get_direction_to(&creep_pos)
+            //NOTE: Direction was previously reversed due to a bug in screeps-game-api. Now fixed.
+            let direction = creep_pos
+                .get_direction_to(next_pos)
                 .ok_or("Expected movement direction")?;
 
-            match creep.move_direction(direction) {
-                ReturnCode::Ok => Ok(()),
-                err => Err(format!("Movement error: {:?}", err)),
-            }?;
+            creep.move_direction(direction)
+                .map_err(|e| format!("Movement error: {:?}", e))?;
         }
 
         {
@@ -304,7 +303,7 @@ where
                 let points = path
                     .iter()
                     .take_while(|p| p.room_name() == creep_room_name)
-                    .map(|p| (p.x() as f32, p.y() as f32))
+                    .map(|p| (p.x().u8() as f32, p.y().u8() as f32))
                     .collect::<Vec<_>>();
 
                 visual.poly(points, Some(visualization));
@@ -331,14 +330,14 @@ where
 
         let destination_room = request.destination.room_name();
 
-        let room_path = game::map::find_route_with_callback(
+        let room_path = game::map::find_route(
             creep_room_name,
             request.destination.room_name(),
-            |to_room_name, from_room_name| {
+            Some(FindRouteOptions::new().room_callback(|to_room_name, from_room_name| {
                 external
                     .get_room_cost(from_room_name, to_room_name, &room_options)
                     .unwrap_or(f64::INFINITY)
-            },
+            })),
         )
         .map_err(|e| format!("Could not find path between rooms: {:?}", e))?;
 
@@ -359,20 +358,16 @@ where
 
         let max_ops = room_names.len() as u32 * 2000;
 
-        let search_options = SearchOptions::new()
-            .max_ops(max_ops)
-            .plain_cost(cost_matrix_options.plains_cost)
-            .swamp_cost(cost_matrix_options.swamp_cost)
-            .room_callback(|room_name: RoomName| -> MultiRoomCostResult {
+        let search_options = SearchOptions::new(|room_name: RoomName| -> MultiRoomCostResult {
                 if room_names.contains(&room_name) {
-                    let mut cost_matrix = CostMatrix::default();
+                    let mut cost_matrix = CostMatrix::new();
 
                     match cost_matrix_system.apply_cost_matrix(
                         room_name,
                         &mut cost_matrix,
                         &cost_matrix_options,
                     ) {
-                        Ok(()) => cost_matrix.into(),
+                        Ok(()) => MultiRoomCostResult::CostMatrix(cost_matrix),
                         Err(_err) => {
                             //TODO: Surface error?
                             MultiRoomCostResult::Impassable
@@ -381,21 +376,24 @@ where
                 } else {
                     MultiRoomCostResult::Impassable
                 }
-            });
+            })
+            .max_ops(max_ops)
+            .plain_cost(cost_matrix_options.plains_cost)
+            .swamp_cost(cost_matrix_options.swamp_cost);
 
         let search_result = pathfinder::search(
-            &creep_pos,
-            &request.destination,
+            creep_pos,
+            request.destination,
             request.range,
-            search_options,
+            Some(search_options),
         );
 
-        if search_result.incomplete {
+        if search_result.incomplete() {
             //TODO: Increment stuck, handle stuck? Increase number of ops?
             return Err("Unable to generate path".to_owned());
         }
 
-        let mut path_points = search_result.load_local_path();
+        let mut path_points = search_result.path();
 
         path_points.insert(0, creep_pos);
 

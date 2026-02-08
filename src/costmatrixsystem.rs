@@ -1,6 +1,5 @@
 use super::costmatrix::*;
 use super::constants::*;
-use screeps::pathfinder::CostMatrix;
 use screeps::*;
 use screeps_cache::*;
 use serde::*;
@@ -155,7 +154,7 @@ impl Default for CostMatrixCache {
 }
 
 impl CostMatrixCache {
-    fn get_room(&mut self, room_name: RoomName) -> CostMatrixRoomAccessor {
+    fn get_room(&mut self, room_name: RoomName) -> CostMatrixRoomAccessor<'_> {
         let entry = self
             .rooms
             .entry(room_name)
@@ -232,34 +231,34 @@ impl<'a> CostMatrixRoomAccessor<'a> {
         let room_name = self.room_name;
 
         let expiration = move |data: &CostMatrixTypeCache<_>| {
-            game::time() - data.last_updated > 0 && game::rooms::get(room_name).is_some()
+            game::time() - data.last_updated > 0 && game::rooms().get(room_name).is_some()
         };
         let filler = move || {
-            let room = game::rooms::get(room_name)?;
+            let room = game::rooms().get(room_name)?;
 
             let mut roads = LinearCostMatrix::new();
             let mut other = LinearCostMatrix::new();
 
-            let structures = room.find(find::STRUCTURES);
+            let structures = room.find(find::STRUCTURES, None);
 
             for structure in structures.iter() {
                 let res = match structure {
-                    Structure::Rampart(r) => {
+                    StructureObject::StructureRampart(r) => {
                         if r.my() || r.is_public() {
                             None
                         } else {
                             Some((u8::MAX, &mut other))
                         }
                     }
-                    Structure::Road(_) => Some((1, &mut roads)),
-                    Structure::Container(_) => Some((2, &mut other)),
+                    StructureObject::StructureRoad(_) => Some((1, &mut roads)),
+                    StructureObject::StructureContainer(_) => Some((2, &mut other)),
                     _ => Some((u8::MAX, &mut other)),
                 };
 
                 if let Some((cost, matrix)) = res {
                     let pos = structure.pos();
 
-                    matrix.set(pos.x() as u8, pos.y() as u8, cost);
+                    matrix.set(pos.x().u8(), pos.y().u8(), cost);
                 }
             }
 
@@ -280,9 +279,9 @@ impl<'a> CostMatrixRoomAccessor<'a> {
 
     pub fn get_construction_sites(&mut self) -> Option<&ConstructionSiteCostMatrixCache> {
         let room_name = self.room_name;
-        let expiration = |data: &CostMatrixTypeCache<_>| game::time() - data.last_updated > 0 && game::rooms::get(room_name).is_some();
+        let expiration = |data: &CostMatrixTypeCache<_>| game::time() - data.last_updated > 0 && game::rooms().get(room_name).is_some();
         let filler = move || {
-            let room = game::rooms::get(room_name)?;
+            let room = game::rooms().get(room_name)?;
 
             let mut blocked_construction_sites = LinearCostMatrix::new();
 
@@ -292,7 +291,7 @@ impl<'a> CostMatrixRoomAccessor<'a> {
             let mut hostile_inactive_construction_sites = LinearCostMatrix::new();
             let mut hostile_active_construction_sites = LinearCostMatrix::new();            
 
-            for construction_site in room.find(find::MY_CONSTRUCTION_SITES).iter() {
+            for construction_site in room.find(find::MY_CONSTRUCTION_SITES, None).iter() {
                 let pos = construction_site.pos();
 
                 let walkable = match construction_site.structure_type() {
@@ -303,27 +302,27 @@ impl<'a> CostMatrixRoomAccessor<'a> {
                 };
 
                 if !walkable {
-                    blocked_construction_sites.set(pos.x() as u8, pos.y() as u8, u8::MAX);
+                    blocked_construction_sites.set(pos.x().u8(), pos.y().u8(), u8::MAX);
                 } else if construction_site.progress() > 0 {
-                    friendly_active_construction_sites.set(pos.x() as u8, pos.y() as u8, 1);
+                    friendly_active_construction_sites.set(pos.x().u8(), pos.y().u8(), 1);
                 } else {
-                    friendly_inactive_construction_sites.set(pos.x() as u8, pos.y() as u8, 1);
+                    friendly_inactive_construction_sites.set(pos.x().u8(), pos.y().u8(), 1);
                 }
             }
 
             let safe_mode = room.controller().and_then(|c| c.safe_mode()).unwrap_or(0) > 0;
 
-            for construction_site in room.find(find::HOSTILE_CONSTRUCTION_SITES).iter() {
+            for construction_site in room.find(find::HOSTILE_CONSTRUCTION_SITES, None).iter() {
                 let pos = construction_site.pos();
 
                 let walkable = !safe_mode;
 
                 if !walkable {
-                    blocked_construction_sites.set(pos.x() as u8, pos.y() as u8, u8::MAX);
+                    blocked_construction_sites.set(pos.x().u8(), pos.y().u8(), u8::MAX);
                 } else if construction_site.progress() > 0 {
-                    hostile_active_construction_sites.set(pos.x() as u8, pos.y() as u8, 1);
+                    hostile_active_construction_sites.set(pos.x().u8(), pos.y().u8(), 1);
                 } else {
-                    hostile_inactive_construction_sites.set(pos.x() as u8, pos.y() as u8, 1);
+                    hostile_inactive_construction_sites.set(pos.x().u8(), pos.y().u8(), 1);
                 }
             }
 
@@ -352,50 +351,47 @@ impl<'a> CostMatrixRoomAccessor<'a> {
         let room_name = self.room_name;
         let expiration = |data: &CostMatrixTypeCache<_>| game::time() - data.last_updated > 0;
         let filler = move || {
-            let room = game::rooms::get(room_name)?;
+            let room = game::rooms().get(room_name)?;
 
             let mut friendly_creeps = LinearCostMatrix::new();
 
-            for creep in room.find(find::MY_CREEPS).iter() {
+            for creep in room.find(find::MY_CREEPS, None).iter() {
                 let pos = creep.pos();
 
-                friendly_creeps.set(pos.x() as u8, pos.y() as u8, u8::MAX);
+                friendly_creeps.set(pos.x().u8(), pos.y().u8(), u8::MAX);
             }
 
-            for power_creep in room.find(find::MY_POWER_CREEPS).iter() {
+            for power_creep in room.find(find::MY_POWER_CREEPS, None).iter() {
                 let pos = power_creep.pos();
 
-                friendly_creeps.set(pos.x() as u8, pos.y() as u8, u8::MAX);
+                friendly_creeps.set(pos.x().u8(), pos.y().u8(), u8::MAX);
             }
 
             let mut hostile_creeps = LinearCostMatrix::new();
 
-            let terrain = room.get_terrain();
-            let terrain = terrain.get_raw_buffer();
+            let terrain = game::map::get_room_terrain(room_name).expect("Expected room terrain");
 
             let mut source_keeper_agro = LinearCostMatrix::new();            
 
-            for creep in room.find(find::HOSTILE_CREEPS).iter() {
+            for creep in room.find(find::HOSTILE_CREEPS, None).iter() {
                 let pos = creep.pos();
 
-                hostile_creeps.set(pos.x() as u8, pos.y() as u8, u8::MAX);
+                hostile_creeps.set(pos.x().u8(), pos.y().u8(), u8::MAX);
 
-                if creep.owner_name() == SOURCE_KEEPER_NAME {
+                if creep.owner().username() == SOURCE_KEEPER_NAME {
                     let pos = creep.pos();
 
-                    let x = pos.x() as i32;
-                    let y = pos.y() as i32;
+                    let x = pos.x().u8() as i32;
+                    let y = pos.y().u8() as i32;
 
                     //TODO: Add constants for room size? Use FastRoomTerrain?
                     
                     for x_offset in x-SOURCE_KEEPER_AGRO_RADIUS as i32..=x+SOURCE_KEEPER_AGRO_RADIUS as i32 {
                         for y_offset in y-SOURCE_KEEPER_AGRO_RADIUS as i32..=y+SOURCE_KEEPER_AGRO_RADIUS as i32 {
                             if x_offset >= 0 && x_offset < 50 && y_offset >= 0 && y_offset < 50 {
-                                let index = (y as usize * 50 as usize) + (x as usize);
-
-                                let offset_terrain = terrain[index];
+                                let tile_terrain = terrain.get(x_offset as u8, y_offset as u8);
                                 
-                                let is_wall = (offset_terrain & TERRAIN_MASK_WALL) != 0;
+                                let is_wall = tile_terrain == Terrain::Wall;
 
                                 if !is_wall {
                                     source_keeper_agro.set(x_offset as u8, y_offset as u8, 1);
@@ -406,10 +402,10 @@ impl<'a> CostMatrixRoomAccessor<'a> {
                 }
             }
 
-            for power_creep in room.find(find::HOSTILE_POWER_CREEPS).iter() {
+            for power_creep in room.find(find::HOSTILE_POWER_CREEPS, None).iter() {
                 let pos = power_creep.pos();
 
-                hostile_creeps.set(pos.x() as u8, pos.y() as u8, u8::MAX);
+                hostile_creeps.set(pos.x().u8(), pos.y().u8(), u8::MAX);
             }
 
             let entry = CostMatrixTypeCache {

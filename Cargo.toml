@@ -2,10 +2,16 @@
 name = "screeps-rover"
 version = "0.1.0"
 authors = ["William Archbell <william@archbell.com>"]
-edition = "2018"
+edition = "2021"
+
+[features]
+default = []
+profile = ["screeps-timing", "screeps-timing-annotate"]
 
 [dependencies]
-screeps-game-api = { version = "0.8" }
+screeps-game-api = "0.23"
 screeps-cache = { git = "https://github.com/Azaril/screeps-cache" }
+screeps-timing = { git = "https://github.com/Azaril/screeps-timing", optional = true }
+screeps-timing-annotate = { git = "https://github.com/Azaril/screeps-timing-annotate", optional = true }
 serde = "1.0"
 log = "0.4"

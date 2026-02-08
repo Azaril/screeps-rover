@@ -1,4 +1,4 @@
-use screeps::pathfinder::*;
+use screeps::*;
 use serde::*;
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -47,25 +47,10 @@ impl Location {
 
         dx.abs().max(dy.abs()) as u8
     }
-}
 
-impl HasLocalPosition for Location {
-    fn x(&self) -> u8 {
-        Self::x(*self)
-    }
-
-    fn y(&self) -> u8 {
-        Self::y(*self)
-    }
-}
-
-impl HasLocalPosition for &Location {
-    fn x(&self) -> u8 {
-        (*self).x()
-    }
-
-    fn y(&self) -> u8 {
-        (*self).y()
+    pub fn to_room_xy(self) -> RoomXY {
+        // SAFETY: We trust that Location values are always in 0..50 range
+        unsafe { RoomXY::unchecked_new(self.x(), self.y()) }
     }
 }
 
