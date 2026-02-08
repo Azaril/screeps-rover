@@ -70,6 +70,12 @@ pub struct LinearCostMatrix {
     data: Vec<(Location, u8)>,
 }
 
+impl Default for LinearCostMatrix {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LinearCostMatrix {
     pub fn new() -> LinearCostMatrix {
         LinearCostMatrix { data: Vec::new() }

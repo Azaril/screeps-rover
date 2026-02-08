@@ -42,6 +42,12 @@ pub struct CostMatrixRoomEntry {
     creeps: Option<CostMatrixTypeCache<CreepCostMatrixCache>>,
 }
 
+impl Default for CostMatrixRoomEntry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CostMatrixRoomEntry {
     pub fn new() -> CostMatrixRoomEntry {
         CostMatrixRoomEntry {
@@ -52,7 +58,7 @@ impl CostMatrixRoomEntry {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct CostMatrixCache {
     rooms: HashMap<RoomName, CostMatrixRoomEntry>,
 }
@@ -145,20 +151,12 @@ impl CostMatrixSystem {
     }
 }
 
-impl Default for CostMatrixCache {
-    fn default() -> CostMatrixCache {
-        CostMatrixCache {
-            rooms: HashMap::new(),
-        }
-    }
-}
-
 impl CostMatrixCache {
     fn get_room(&mut self, room_name: RoomName) -> CostMatrixRoomAccessor<'_> {
         let entry = self
             .rooms
             .entry(room_name)
-            .or_insert_with(CostMatrixRoomEntry::new);
+            .or_default();
 
         CostMatrixRoomAccessor { room_name, entry }
     }
@@ -294,12 +292,7 @@ impl<'a> CostMatrixRoomAccessor<'a> {
             for construction_site in room.find(find::MY_CONSTRUCTION_SITES, None).iter() {
                 let pos = construction_site.pos();
 
-                let walkable = match construction_site.structure_type() {
-                    StructureType::Container => true,
-                    StructureType::Road => true,
-                    StructureType::Rampart => true,
-                    _ => false
-                };
+                let walkable = matches!(construction_site.structure_type(), StructureType::Container | StructureType::Road | StructureType::Rampart);
 
                 if !walkable {
                     blocked_construction_sites.set(pos.x().u8(), pos.y().u8(), u8::MAX);
@@ -388,7 +381,7 @@ impl<'a> CostMatrixRoomAccessor<'a> {
                     
                     for x_offset in x-SOURCE_KEEPER_AGRO_RADIUS as i32..=x+SOURCE_KEEPER_AGRO_RADIUS as i32 {
                         for y_offset in y-SOURCE_KEEPER_AGRO_RADIUS as i32..=y+SOURCE_KEEPER_AGRO_RADIUS as i32 {
-                            if x_offset >= 0 && x_offset < 50 && y_offset >= 0 && y_offset < 50 {
+                            if (0..50).contains(&x_offset) && (0..50).contains(&y_offset) {
                                 let tile_terrain = terrain.get(x_offset as u8, y_offset as u8);
                                 
                                 let is_wall = tile_terrain == Terrain::Wall;
