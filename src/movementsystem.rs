@@ -151,7 +151,8 @@ where
             move_options
         };
 
-        creep.move_to_with_options(request.destination, Some(vis_move_options))
+        creep
+            .move_to_with_options(request.destination, Some(vis_move_options))
             .map_err(|e| format!("Move error: {:?}", e))?;
 
         Ok(())
@@ -205,7 +206,7 @@ where
 
             let move_result = {
                 let creep_data = external.get_creep_movement_data(entity)?;
-                
+
                 if let Some(path_data) = creep_data.path_data.as_mut() {
                     path_data.time += 1;
 
@@ -239,8 +240,12 @@ where
                 }
             };
 
-            let path_expired = move_result.map(|(path_time, _)| path_time >= self.reuse_path_length).unwrap_or(false);
-            let stuck = move_result.map(|(_, stuck_count)| stuck_count > 1).unwrap_or(false);
+            let path_expired = move_result
+                .map(|(path_time, _)| path_time >= self.reuse_path_length)
+                .unwrap_or(false);
+            let stuck = move_result
+                .map(|(_, stuck_count)| stuck_count > 1)
+                .unwrap_or(false);
 
             //
             // Generate path if required.
@@ -280,7 +285,8 @@ where
                 .get_direction_to(next_pos)
                 .ok_or("Expected movement direction")?;
 
-            creep.move_direction(direction)
+            creep
+                .move_direction(direction)
                 .map_err(|e| format!("Movement error: {:?}", e))?;
         }
 
@@ -318,7 +324,7 @@ where
         external: &mut S,
         request: &MovementRequest,
         creep: &Creep,
-        is_stuck: bool
+        is_stuck: bool,
     ) -> Result<Vec<Position>, MovementError>
     where
         S: MovementSystemExternal<Handle>,
@@ -333,11 +339,13 @@ where
         let room_path = game::map::find_route(
             creep_room_name,
             request.destination.room_name(),
-            Some(FindRouteOptions::new().room_callback(|to_room_name, from_room_name| {
-                external
-                    .get_room_cost(from_room_name, to_room_name, &room_options)
-                    .unwrap_or(f64::INFINITY)
-            })),
+            Some(
+                FindRouteOptions::new().room_callback(|to_room_name, from_room_name| {
+                    external
+                        .get_room_cost(from_room_name, to_room_name, &room_options)
+                        .unwrap_or(f64::INFINITY)
+                }),
+            ),
         )
         .map_err(|e| format!("Could not find path between rooms: {:?}", e))?;
 
@@ -359,27 +367,27 @@ where
         let max_ops = room_names.len() as u32 * 2000;
 
         let search_options = SearchOptions::new(|room_name: RoomName| -> MultiRoomCostResult {
-                if room_names.contains(&room_name) {
-                    let mut cost_matrix = CostMatrix::new();
+            if room_names.contains(&room_name) {
+                let mut cost_matrix = CostMatrix::new();
 
-                    match cost_matrix_system.apply_cost_matrix(
-                        room_name,
-                        &mut cost_matrix,
-                        &cost_matrix_options,
-                    ) {
-                        Ok(()) => MultiRoomCostResult::CostMatrix(cost_matrix),
-                        Err(_err) => {
-                            //TODO: Surface error?
-                            MultiRoomCostResult::Impassable
-                        }
+                match cost_matrix_system.apply_cost_matrix(
+                    room_name,
+                    &mut cost_matrix,
+                    &cost_matrix_options,
+                ) {
+                    Ok(()) => MultiRoomCostResult::CostMatrix(cost_matrix),
+                    Err(_err) => {
+                        //TODO: Surface error?
+                        MultiRoomCostResult::Impassable
                     }
-                } else {
-                    MultiRoomCostResult::Impassable
                 }
-            })
-            .max_ops(max_ops)
-            .plain_cost(cost_matrix_options.plains_cost)
-            .swamp_cost(cost_matrix_options.swamp_cost);
+            } else {
+                MultiRoomCostResult::Impassable
+            }
+        })
+        .max_ops(max_ops)
+        .plain_cost(cost_matrix_options.plains_cost)
+        .swamp_cost(cost_matrix_options.swamp_cost);
 
         let search_result = pathfinder::search(
             creep_pos,

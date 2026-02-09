@@ -1,5 +1,5 @@
-use super::costmatrix::*;
 use super::constants::*;
+use super::costmatrix::*;
 use screeps::*;
 use screeps_cache::*;
 use serde::*;
@@ -22,7 +22,7 @@ pub struct ConstructionSiteCostMatrixCache {
     blocked_construction_sites: LinearCostMatrix,
     friendly_inactive_construction_sites: LinearCostMatrix,
     friendly_active_construction_sites: LinearCostMatrix,
-    hostile_inactive_construction_sites: LinearCostMatrix,    
+    hostile_inactive_construction_sites: LinearCostMatrix,
     hostile_active_construction_sites: LinearCostMatrix,
 }
 
@@ -37,7 +37,7 @@ pub struct CreepCostMatrixCache {
 pub struct CostMatrixRoomEntry {
     structures: Option<CostMatrixTypeCache<StuctureCostMatrixCache>>,
     #[serde(skip)]
-    construction_sites: Option<CostMatrixTypeCache<ConstructionSiteCostMatrixCache>>,    
+    construction_sites: Option<CostMatrixTypeCache<ConstructionSiteCostMatrixCache>>,
     #[serde(skip)]
     creeps: Option<CostMatrixTypeCache<CreepCostMatrixCache>>,
 }
@@ -82,7 +82,7 @@ pub struct CostMatrixOptions {
     pub source_keeper_aggro_cost: u8,
     pub friendly_inactive_construction_site_cost: Option<u8>,
     pub friendly_active_construction_site_cost: Option<u8>,
-    pub hostile_inactive_construction_site_cost: Option<u8>,    
+    pub hostile_inactive_construction_site_cost: Option<u8>,
     pub hostile_active_construction_site_cost: Option<u8>,
 }
 
@@ -153,10 +153,7 @@ impl CostMatrixSystem {
 
 impl CostMatrixCache {
     fn get_room(&mut self, room_name: RoomName) -> CostMatrixRoomAccessor<'_> {
-        let entry = self
-            .rooms
-            .entry(room_name)
-            .or_default();
+        let entry = self.rooms.entry(room_name).or_default();
 
         CostMatrixRoomAccessor { room_name, entry }
     }
@@ -181,13 +178,27 @@ impl CostMatrixCache {
 
         if options.construction_sites {
             if let Some(construction_sites) = room.get_construction_sites() {
-                construction_sites.blocked_construction_sites.apply_to(cost_matrix);
+                construction_sites
+                    .blocked_construction_sites
+                    .apply_to(cost_matrix);
 
                 let applicators = [
-                    (options.friendly_inactive_construction_site_cost, &construction_sites.friendly_inactive_construction_sites),
-                    (options.friendly_active_construction_site_cost, &construction_sites.friendly_active_construction_sites),
-                    (options.hostile_inactive_construction_site_cost, &construction_sites.hostile_inactive_construction_sites),
-                    (options.hostile_active_construction_site_cost, &construction_sites.hostile_active_construction_sites),
+                    (
+                        options.friendly_inactive_construction_site_cost,
+                        &construction_sites.friendly_inactive_construction_sites,
+                    ),
+                    (
+                        options.friendly_active_construction_site_cost,
+                        &construction_sites.friendly_active_construction_sites,
+                    ),
+                    (
+                        options.hostile_inactive_construction_site_cost,
+                        &construction_sites.hostile_inactive_construction_sites,
+                    ),
+                    (
+                        options.hostile_active_construction_site_cost,
+                        &construction_sites.hostile_active_construction_sites,
+                    ),
                 ];
 
                 //TODO: Rework API to generate an iterator to batch the full set of cost matrix modifies.
@@ -195,14 +206,16 @@ impl CostMatrixCache {
                     if let Some(cost) = cost {
                         source_matrix.apply_to_transformed(cost_matrix, |_| *cost);
                     }
-                }        
+                }
             }
         }
 
         if options.friendly_creeps || options.hostile_creeps || options.source_keeper_aggro {
             if let Some(creeps) = room.get_creeps() {
                 if options.source_keeper_aggro {
-                    creeps.source_keeper_agro.apply_to_transformed(cost_matrix, |_| options.source_keeper_aggro_cost)
+                    creeps
+                        .source_keeper_agro
+                        .apply_to_transformed(cost_matrix, |_| options.source_keeper_aggro_cost)
                 }
 
                 if options.friendly_creeps {
@@ -277,7 +290,9 @@ impl<'a> CostMatrixRoomAccessor<'a> {
 
     pub fn get_construction_sites(&mut self) -> Option<&ConstructionSiteCostMatrixCache> {
         let room_name = self.room_name;
-        let expiration = |data: &CostMatrixTypeCache<_>| game::time() - data.last_updated > 0 && game::rooms().get(room_name).is_some();
+        let expiration = |data: &CostMatrixTypeCache<_>| {
+            game::time() - data.last_updated > 0 && game::rooms().get(room_name).is_some()
+        };
         let filler = move || {
             let room = game::rooms().get(room_name)?;
 
@@ -287,12 +302,15 @@ impl<'a> CostMatrixRoomAccessor<'a> {
             let mut friendly_active_construction_sites = LinearCostMatrix::new();
 
             let mut hostile_inactive_construction_sites = LinearCostMatrix::new();
-            let mut hostile_active_construction_sites = LinearCostMatrix::new();            
+            let mut hostile_active_construction_sites = LinearCostMatrix::new();
 
             for construction_site in room.find(find::MY_CONSTRUCTION_SITES, None).iter() {
                 let pos = construction_site.pos();
 
-                let walkable = matches!(construction_site.structure_type(), StructureType::Container | StructureType::Road | StructureType::Rampart);
+                let walkable = matches!(
+                    construction_site.structure_type(),
+                    StructureType::Container | StructureType::Road | StructureType::Rampart
+                );
 
                 if !walkable {
                     blocked_construction_sites.set(pos.x().u8(), pos.y().u8(), u8::MAX);
@@ -326,7 +344,7 @@ impl<'a> CostMatrixRoomAccessor<'a> {
                     friendly_inactive_construction_sites,
                     friendly_active_construction_sites,
                     hostile_inactive_construction_sites,
-                    hostile_active_construction_sites
+                    hostile_active_construction_sites,
                 },
             };
 
@@ -364,7 +382,7 @@ impl<'a> CostMatrixRoomAccessor<'a> {
 
             let terrain = game::map::get_room_terrain(room_name).expect("Expected room terrain");
 
-            let mut source_keeper_agro = LinearCostMatrix::new();            
+            let mut source_keeper_agro = LinearCostMatrix::new();
 
             for creep in room.find(find::HOSTILE_CREEPS, None).iter() {
                 let pos = creep.pos();
@@ -378,12 +396,16 @@ impl<'a> CostMatrixRoomAccessor<'a> {
                     let y = pos.y().u8() as i32;
 
                     //TODO: Add constants for room size? Use FastRoomTerrain?
-                    
-                    for x_offset in x-SOURCE_KEEPER_AGRO_RADIUS as i32..=x+SOURCE_KEEPER_AGRO_RADIUS as i32 {
-                        for y_offset in y-SOURCE_KEEPER_AGRO_RADIUS as i32..=y+SOURCE_KEEPER_AGRO_RADIUS as i32 {
+
+                    for x_offset in
+                        x - SOURCE_KEEPER_AGRO_RADIUS as i32..=x + SOURCE_KEEPER_AGRO_RADIUS as i32
+                    {
+                        for y_offset in y - SOURCE_KEEPER_AGRO_RADIUS as i32
+                            ..=y + SOURCE_KEEPER_AGRO_RADIUS as i32
+                        {
                             if (0..50).contains(&x_offset) && (0..50).contains(&y_offset) {
                                 let tile_terrain = terrain.get(x_offset as u8, y_offset as u8);
-                                
+
                                 let is_wall = tile_terrain == Terrain::Wall;
 
                                 if !is_wall {
@@ -406,7 +428,7 @@ impl<'a> CostMatrixRoomAccessor<'a> {
                 data: CreepCostMatrixCache {
                     friendly_creeps,
                     hostile_creeps,
-                    source_keeper_agro
+                    source_keeper_agro,
                 },
             };
 
