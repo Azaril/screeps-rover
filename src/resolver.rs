@@ -198,9 +198,103 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
     };
 
     // Step 3: For each desired tile, resolve who gets to move there.
-    // Process tiles in a deterministic order for reproducibility.
-    let mut tiles: Vec<Position> = intent_map.keys().copied().collect();
-    tiles.sort_by_key(|p| (p.room_name(), p.x().u8(), p.y().u8()));
+    // Process tiles in dependency order: if creep X wants tile T, and T is
+    // occupied by creep Y who wants tile T2, then T2 should be processed
+    // before T. This ensures convoy-style movement (A→B→C all moving the
+    // same direction) resolves front-to-back: C moves first, freeing space
+    // for B, which frees space for A.
+    let tiles = {
+        let all_tiles: Vec<Position> = intent_map.keys().copied().collect();
+
+        // Build dependency graph: tile T depends on tile T2 if T is occupied
+        // by a creep that wants T2. "T depends on T2" means T2 should be
+        // processed first.
+        let mut tile_deps: HashMap<Position, Vec<Position>> = HashMap::new();
+        for &tile in &all_tiles {
+            tile_deps.entry(tile).or_default();
+        }
+
+        for &tile in &all_tiles {
+            // Who is currently sitting on `tile`?
+            if let Some(occupant_handle) = current_pos_to_entity.get(&tile) {
+                if let Some(occupant) = creeps.get(occupant_handle) {
+                    if !occupant.resolved {
+                        if let Some(occ_desired) = occupant.desired_pos {
+                            // The occupant wants occ_desired. If occ_desired is
+                            // also a contested tile, then `tile` depends on
+                            // occ_desired being resolved first. We model this
+                            // as an edge occ_desired → tile (occ_desired must
+                            // come before tile in processing order).
+                            if intent_map.contains_key(&occ_desired) && occ_desired != tile {
+                                tile_deps.entry(occ_desired).or_default().push(tile);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Topological sort of tiles (Kahn's algorithm). Tiles with in-degree 0
+        // have no blockers and are processed first (front of convoy). Ties
+        // broken by spatial order for determinism.
+        let mut in_degree: HashMap<Position, usize> = HashMap::new();
+        for &tile in &all_tiles {
+            in_degree.entry(tile).or_insert(0);
+        }
+        for successors in tile_deps.values() {
+            for successor in successors {
+                if let Some(deg) = in_degree.get_mut(successor) {
+                    *deg += 1;
+                }
+            }
+        }
+
+        let mut queue: std::collections::VecDeque<Position> = {
+            let mut v: Vec<Position> = in_degree
+                .iter()
+                .filter(|(_, &deg)| deg == 0)
+                .map(|(&pos, _)| pos)
+                .collect();
+            v.sort_by_key(|p| (p.room_name(), p.x().u8(), p.y().u8()));
+            v.into()
+        };
+
+        let mut sorted_tiles: Vec<Position> = Vec::with_capacity(all_tiles.len());
+
+        while let Some(tile) = queue.pop_front() {
+            sorted_tiles.push(tile);
+
+            if let Some(successors) = tile_deps.get(&tile) {
+                let mut new_ready: Vec<Position> = Vec::new();
+                for successor in successors {
+                    if let Some(deg) = in_degree.get_mut(successor) {
+                        *deg -= 1;
+                        if *deg == 0 {
+                            new_ready.push(*successor);
+                        }
+                    }
+                }
+                // Sort newly ready tiles and append to maintain deterministic order.
+                new_ready.sort_by_key(|p| (p.room_name(), p.x().u8(), p.y().u8()));
+                for tile in new_ready {
+                    queue.push_back(tile);
+                }
+            }
+        }
+
+        // Any remaining tiles (cycles) appended in spatial order.
+        if sorted_tiles.len() < all_tiles.len() {
+            let mut remaining: Vec<Position> = all_tiles
+                .iter()
+                .filter(|t| !sorted_tiles.contains(t))
+                .copied()
+                .collect();
+            remaining.sort_by_key(|p| (p.room_name(), p.x().u8(), p.y().u8()));
+            sorted_tiles.extend(remaining);
+        }
+
+        sorted_tiles
+    };
 
     for tile in &tiles {
         let candidates = &intent_map[tile];
@@ -389,6 +483,47 @@ fn try_shove<Handle: Hash + Eq + Copy + Ord>(
         .collect();
     for (pos, handle) in idle_creep_positions.iter() {
         unresolved_pos_to_entity.entry(*pos).or_insert(*handle);
+    }
+
+    // Prefer resolving the creep to its desired position before trying
+    // arbitrary adjacent tiles. This lets convoy creeps advance along their
+    // path instead of being shoved sideways, preventing oscillation when
+    // multiple adjacent creeps are moving in the same direction.
+    if let Some(desired) = creep.desired_pos {
+        if desired != creep.current_pos
+            && is_tile_walkable(desired)
+            && !firmly_occupied.contains(&desired)
+        {
+            // Respect anchor constraint.
+            let anchor_ok = creep
+                .anchor
+                .map(|ac| desired.get_range_to(ac.position) <= ac.range)
+                .unwrap_or(true);
+
+            if anchor_ok {
+                // If an unresolved creep is at the desired tile, try to
+                // chain-resolve it first (recursive, depth + 1).
+                let tile_free =
+                    if let Some(&neighbor_entity) = unresolved_pos_to_entity.get(&desired) {
+                        try_shove(
+                            neighbor_entity,
+                            creeps,
+                            idle_creep_positions,
+                            is_tile_walkable,
+                            depth + 1,
+                        )
+                    } else {
+                        true
+                    };
+
+                if tile_free {
+                    let creep = creeps.get_mut(&entity).unwrap();
+                    creep.resolved = true;
+                    creep.final_pos = desired;
+                    return true;
+                }
+            }
+        }
     }
 
     for direction in Direction::iter() {

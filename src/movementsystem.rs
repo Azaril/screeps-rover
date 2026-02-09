@@ -643,19 +643,45 @@ where
     {
         let creep_pos = creep.pos();
 
-        // Validate and reuse cached path.
+        // Validate and reuse cached path. If the creep was shoved off its
+        // path (within 1 tile of a path point but not on it), re-anchor to the
+        // nearest path point instead of invalidating the entire path.
         {
             let creep_data = external
                 .get_creep_movement_data(entity)
                 .map_err(MovementFailure::InternalError)?;
 
-            if let Some(path_data) = &creep_data.path_data {
-                let path_valid = path_data.destination == destination
-                    && path_data.range == range
-                    && path_data.path.iter().take(2).any(|p| *p == creep_pos);
+            if let Some(path_data) = &mut creep_data.path_data {
+                let dest_matches =
+                    path_data.destination == destination && path_data.range == range;
 
-                if !path_valid {
+                if !dest_matches {
                     creep_data.path_data = None;
+                } else {
+                    // Check if creep is on the path (first 2 points).
+                    let on_path = path_data.path.iter().take(2).any(|p| *p == creep_pos);
+
+                    if !on_path {
+                        // Creep is not on the expected path points. Check if it
+                        // was shoved nearby (within 1 tile of a path point in
+                        // the first few positions). If so, re-anchor to that
+                        // point to reuse the path instead of a full repath.
+                        let nearby_index = path_data
+                            .path
+                            .iter()
+                            .take(4)
+                            .position(|p| creep_pos.get_range_to(*p) <= 1);
+
+                        if let Some(idx) = nearby_index {
+                            // Trim the path so the nearby point becomes the
+                            // first element. The creep will pathfind one step
+                            // to rejoin, then resume the cached path.
+                            path_data.path.drain(..idx);
+                        } else {
+                            // Too far from any path point; invalidate.
+                            creep_data.path_data = None;
+                        }
+                    }
                 }
             }
         }
@@ -672,6 +698,7 @@ where
 
                 let path = &mut path_data.path;
 
+                // Find the creep's position in the first 2 path points.
                 let current_index = path
                     .iter()
                     .take(2)
@@ -679,7 +706,26 @@ where
                     .find(|(_, p)| **p == creep_pos)
                     .map(|(index, _)| index);
 
-                match current_index {
+                // If not found exactly, check if the creep is adjacent to
+                // path[0] (shoved off-path last tick). Treat this as being
+                // at index 0 (no progress along path) so the path is reused
+                // and the next step will move toward path[0] or path[1].
+                let (effective_index, was_shoved_off) = match current_index {
+                    Some(idx) => (Some(idx), false),
+                    None => {
+                        let adjacent_to_start = path
+                            .first()
+                            .map(|p| creep_pos.get_range_to(*p) <= 1)
+                            .unwrap_or(false);
+                        if adjacent_to_start {
+                            (Some(0), true)
+                        } else {
+                            (None, false)
+                        }
+                    }
+                };
+
+                match effective_index {
                     Some(idx) => {
                         let moved = idx > 0;
                         path.drain(..idx);
@@ -689,16 +735,18 @@ where
                         }
 
                         // Update stuck state.
-                        if moved {
-                            path_data.stuck_state.record_moved(current_distance);
-                        } else {
+                        if was_shoved_off || !moved {
+                            // Shoved off path or didn't advance: record as
+                            // immobile so stuck detection can escalate.
                             path_data.stuck_state.record_immobile(current_distance);
+                        } else {
+                            path_data.stuck_state.record_moved(current_distance);
                         }
 
                         (Some(path_data.time), Some(path_data.stuck_state.clone()))
                     }
                     None => {
-                        // Creep is not on the path; invalidate.
+                        // Creep is not on or near the path; invalidate.
                         creep_data.path_data = None;
                         (None, None)
                     }
@@ -761,7 +809,14 @@ where
             .as_ref()
             .ok_or(MovementFailure::PathNotFound)?;
 
-        let next_pos = path_data.path.get(1).copied();
+        // If the creep is on path[0], the next step is path[1].
+        // If the creep was shoved off-path (adjacent to path[0] but not on it),
+        // the next step is path[0] itself to rejoin the cached path.
+        let next_pos = if path_data.path.first() == Some(&creep_pos) {
+            path_data.path.get(1).copied()
+        } else {
+            path_data.path.first().copied()
+        };
 
         Ok(next_pos)
     }
