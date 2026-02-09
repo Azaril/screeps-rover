@@ -131,6 +131,19 @@ impl CostMatrixSystem {
             .map(|c| storage.set_cache(storage_segment, c));
     }
 
+    /// Build a `LocalCostMatrix` (Rust-native) for a room with the given options.
+    /// This avoids JS interop during construction; the caller converts to `CostMatrix`
+    /// only at the `pathfinder::search()` boundary.
+    pub fn build_local_cost_matrix(
+        &mut self,
+        room_name: RoomName,
+        options: &CostMatrixOptions,
+    ) -> Result<screeps::local::LocalCostMatrix, String> {
+        let cache = self.get_cache();
+        cache.build_local_cost_matrix(room_name, options)
+    }
+
+    /// Legacy: apply cost matrix layers directly to a JS CostMatrix.
     pub fn apply_cost_matrix(
         &mut self,
         room_name: RoomName,
@@ -229,6 +242,81 @@ impl CostMatrixCache {
         }
 
         Ok(())
+    }
+
+    /// Build a `LocalCostMatrix` (Rust-native `[u8; 2500]`) for a room.
+    /// All computation happens in Rust memory; no JS interop until the caller
+    /// converts to `CostMatrix` at the search boundary.
+    pub fn build_local_cost_matrix(
+        &mut self,
+        room_name: RoomName,
+        options: &CostMatrixOptions,
+    ) -> Result<screeps::local::LocalCostMatrix, String> {
+        let mut lcm = screeps::local::LocalCostMatrix::new();
+        let mut room = self.get_room(room_name);
+
+        if options.structures {
+            if let Some(structures) = room.get_structures() {
+                structures
+                    .roads
+                    .apply_to_transformed(&mut lcm, |_| options.road_cost);
+
+                structures.other.apply_to(&mut lcm);
+            }
+        }
+
+        if options.construction_sites {
+            if let Some(construction_sites) = room.get_construction_sites() {
+                construction_sites
+                    .blocked_construction_sites
+                    .apply_to(&mut lcm);
+
+                let applicators = [
+                    (
+                        options.friendly_inactive_construction_site_cost,
+                        &construction_sites.friendly_inactive_construction_sites,
+                    ),
+                    (
+                        options.friendly_active_construction_site_cost,
+                        &construction_sites.friendly_active_construction_sites,
+                    ),
+                    (
+                        options.hostile_inactive_construction_site_cost,
+                        &construction_sites.hostile_inactive_construction_sites,
+                    ),
+                    (
+                        options.hostile_active_construction_site_cost,
+                        &construction_sites.hostile_active_construction_sites,
+                    ),
+                ];
+
+                for (cost, source_matrix) in &applicators {
+                    if let Some(cost) = cost {
+                        source_matrix.apply_to_transformed(&mut lcm, |_| *cost);
+                    }
+                }
+            }
+        }
+
+        if options.friendly_creeps || options.hostile_creeps || options.source_keeper_aggro {
+            if let Some(creeps) = room.get_creeps() {
+                if options.source_keeper_aggro {
+                    creeps
+                        .source_keeper_agro
+                        .apply_to_transformed(&mut lcm, |_| options.source_keeper_aggro_cost)
+                }
+
+                if options.friendly_creeps {
+                    creeps.friendly_creeps.apply_to(&mut lcm);
+                }
+
+                if options.hostile_creeps {
+                    creeps.hostile_creeps.apply_to(&mut lcm);
+                }
+            }
+        }
+
+        Ok(lcm)
     }
 }
 
