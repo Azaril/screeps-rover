@@ -2,10 +2,14 @@
 
 A coordinated movement and pathfinding library for [Screeps](https://screeps.com/), written in Rust. screeps-rover manages multi-creep movement with global conflict resolution, path caching, stuck detection, and layered cost matrices — all designed for the tick-based, CPU-constrained Screeps runtime.
 
+**Decoupled from the Screeps runtime:** The core library uses only pure-Rust data types from `screeps-game-api` (which compile on native targets). All JS interop calls (pathfinding, creep actions, room queries, visualization) are abstracted behind traits. Enable the `screeps` feature for real game API implementations, or provide your own for offline testing and simulation.
+
 ## Table of Contents
 
 - [Overview](#overview)
+- [Features](#features)
 - [Architecture](#architecture)
+- [Trait Abstractions](#trait-abstractions)
 - [Tick Lifecycle](#tick-lifecycle)
 - [Movement Requests](#movement-requests)
 - [Pathfinding & Path Caching](#pathfinding--path-caching)
@@ -29,6 +33,15 @@ In Screeps, dozens of creeps navigate a shared grid world simultaneously. Naivel
 - **Layered cost matrices** — composable terrain, structure, creep, and construction site layers with per-room caching
 - **Anchor constraints** — keep stationary workers within work range even when shoved
 - **Pull mechanics** — support for the Screeps pull API to move fatigued creeps
+- **Offline-capable** — core algorithms work without the Screeps runtime; all game API calls are behind traits
+
+## Features
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| *(none)* | ✓ | Core library with trait abstractions. Compiles on native targets for offline testing. |
+| `screeps` | | Real game API implementations: `ScreepsPathfinder`, `ScreepsCostMatrixDataSource`, `ScreepsMovementVisualizer`, `impl CreepHandle for screeps::Creep`. Required when running in the Screeps game. |
+| `profile` | | Profiling instrumentation via `screeps-timing`. |
 
 ## Architecture
 
@@ -37,6 +50,9 @@ In Screeps, dozens of creeps navigate a shared grid world simultaneously. Naivel
 │                         Consumer (bot logic)                        │
 │   Operations → Missions → Jobs                                     │
 │   Each job creates MovementRequests via MovementData                │
+│   Consumer provides: PathfindingProvider, CostMatrixDataSource,     │
+│                      MovementVisualizer (optional),                 │
+│                      MovementSystemExternal                         │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │  MovementData<Handle>
                                ▼
@@ -66,7 +82,85 @@ In Screeps, dozens of creeps navigate a shared grid world simultaneously. Naivel
                     (Moving / Arrived / Stuck / Failed)
 ```
 
-The library is generic over a `Handle` type (`Hash + Eq + Copy`) that identifies creeps. The consumer implements the `MovementSystemExternal<Handle>` trait to bridge between its own entity model and the Screeps API.
+The library is generic over a `Handle` type (`Hash + Eq + Copy + Ord`) that identifies creeps. The consumer implements the `MovementSystemExternal<Handle>` trait to bridge between its own entity model and the creep abstraction.
+
+## Trait Abstractions
+
+All game API calls are abstracted behind traits, allowing the library to run offline or with custom implementations.
+
+### `CreepHandle`
+
+Abstracts the Screeps `Creep` game object. The `screeps` feature provides `impl CreepHandle for screeps::Creep`.
+
+```rust
+pub trait CreepHandle {
+    fn pos(&self) -> Position;
+    fn fatigue(&self) -> u32;
+    fn spawning(&self) -> bool;
+    fn move_direction(&self, dir: Direction) -> Result<(), String>;
+    fn pull(&self, other: &Self) -> Result<(), String>;
+    fn move_pulled_by(&self, other: &Self) -> Result<(), String>;
+}
+```
+
+### `MovementSystemExternal<Handle>`
+
+The consumer implements this to bridge between its entity model and the creep abstraction:
+
+```rust
+pub trait MovementSystemExternal<Handle> {
+    type Creep: CreepHandle;
+
+    fn get_creep(&self, entity: Handle) -> Result<Self::Creep, MovementError>;
+    fn get_creep_movement_data(&mut self, entity: Handle)
+        -> Result<&mut CreepMovementData, MovementError>;
+    fn get_room_cost(&self, from: RoomName, to: RoomName,
+                     options: &RoomOptions) -> Option<f64>;
+    fn get_entity_position(&self, entity: Handle) -> Option<Position>;
+}
+```
+
+### `PathfindingProvider`
+
+Abstracts the Screeps pathfinder. The `screeps` feature provides `ScreepsPathfinder`.
+
+```rust
+pub trait PathfindingProvider {
+    fn search(...) -> PathfindingResult;
+    fn search_many(...) -> PathfindingResult;
+    fn find_route(...) -> Result<Vec<RouteStep>, String>;
+    fn get_room_linear_distance(&self, from: RoomName, to: RoomName) -> u32;
+    fn is_tile_walkable(&self, pos: Position) -> bool;
+}
+```
+
+### `CostMatrixDataSource`
+
+Abstracts game state queries for building cost matrices. The `screeps` feature provides `ScreepsCostMatrixDataSource`. Caching/expiration is the implementor's concern.
+
+```rust
+pub trait CostMatrixDataSource {
+    fn get_structure_costs(&self, room_name: RoomName) -> Option<StuctureCostMatrixCache>;
+    fn get_construction_site_costs(&self, room_name: RoomName) -> Option<ConstructionSiteCostMatrixCache>;
+    fn get_creep_costs(&self, room_name: RoomName) -> Option<CreepCostMatrixCache>;
+}
+```
+
+### `MovementVisualizer`
+
+Optional intent-based visualization callbacks. Instead of drawing primitives, the movement system reports *what* happened and the implementor decides *how* to render it. The `screeps` feature provides `ScreepsMovementVisualizer` which renders directly to `RoomVisual`. Pass `None` to disable visualization entirely.
+
+```rust
+pub trait MovementVisualizer {
+    fn visualize_path(&mut self, creep_pos: Position, path: &[Position]);
+    fn visualize_anchor(&mut self, creep_pos: Position, anchor_pos: Position);
+    fn visualize_immovable(&mut self, creep_pos: Position);
+    fn visualize_stuck(&mut self, creep_pos: Position, ticks: u16);
+    fn visualize_failed(&mut self, creep_pos: Position);
+}
+```
+
+Visualization is controlled at two levels: globally by whether a `MovementVisualizer` is provided to `MovementSystem::new` (pass `None` to disable all visualization), and per-request via the builder (`.visualize(false)` to suppress an individual request). Requests default to `visualize: true`.
 
 ## Tick Lifecycle
 
@@ -102,7 +196,7 @@ Tick N
 │   │   • Respect anchor constraints and immovable flags
 │   │
 │   └── Pass 3 ─ Execute Movement
-│       Issue Screeps intents:
+│       Issue intents via CreepHandle:
 │       • move_direction() for normal movement
 │       • pull() + move_pulled_by() for pull mechanics
 │       Record per-creep results.
@@ -135,16 +229,16 @@ movement_data
 
 // Flee from threats
 movement_data
-    .flee(entity, &[FleeTarget { pos: enemy_pos, range: 5 }]);
+    .flee(entity, vec![FleeTarget { pos: enemy_pos, range: 5 }]);
 ```
 
 ### Intent Types
 
 | Intent | Description | Pathfinding |
 |--------|-------------|-------------|
-| **MoveTo** | Navigate to a position within range | Cached multi-room A* via `pathfinder::search()` |
+| **MoveTo** | Navigate to a position within range | Cached multi-room A* via `PathfindingProvider::search()` |
 | **Follow** | Trail behind another entity | Derived from leader's resolved movement; falls back to pathfinding if leader is distant |
-| **Flee** | Move away from one or more threats | `pathfinder::search_many()` with `flee: true` |
+| **Flee** | Move away from one or more threats | `PathfindingProvider::search_many()` with flee mode |
 
 ### Priority Levels
 
@@ -159,11 +253,11 @@ movement_data
 
 ### Path Generation
 
-Paths are generated via the Screeps `pathfinder::search()` API with custom cost matrices:
+Paths are generated via the `PathfindingProvider` trait with custom cost matrices:
 
-1. **Room routing** — `game::map::find_route()` determines the sequence of rooms to traverse, using `get_room_cost()` from the external trait and room status checks (novice/respawn/closed zone rules).
-2. **Cost matrix construction** — For each room in the route, `CostMatrixSystem` builds a `LocalCostMatrix` from cached layers (structures, creeps, construction sites, source keeper aggro).
-3. **Search** — The pathfinder runs with configurable `max_ops`, `max_rooms`, `plains_cost`, and `swamp_cost`. Stuck escalation may modify these parameters.
+1. **Room routing** — `PathfindingProvider::find_route()` determines the sequence of rooms to traverse, using `get_room_cost()` from the external trait.
+2. **Cost matrix construction** — For each room in the route, `CostMatrixSystem` builds a `LocalCostMatrix` from cached layers (structures, creeps, construction sites, source keeper aggro) via the `CostMatrixDataSource` trait.
+3. **Search** — The pathfinder runs with configurable `max_ops`, `plains_cost`, and `swamp_cost`. Stuck escalation may modify these parameters.
 
 ### Path Caching
 
@@ -236,8 +330,6 @@ Two creeps wanting each other's tiles (head-to-head) are detected and resolved a
 - Both have `allow_swap` enabled
 - Both satisfy their anchor constraints at the new position
 
-Swaps use the Screeps `move_direction()` intent — the game engine handles the actual position exchange.
-
 ### Chain Shoving
 
 When a higher-priority creep needs a tile occupied by another creep, the resolver attempts to shove the occupant to an adjacent walkable tile:
@@ -300,7 +392,7 @@ Thresholds are configurable per-creep via `StuckThresholds`, allowing military c
 
 ## Cost Matrix System
 
-The `CostMatrixSystem` builds per-room cost matrices from composable layers with caching.
+The `CostMatrixSystem` builds per-room cost matrices from composable layers with caching. It operates on a user-owned `CostMatrixCache` (passed as `&mut CostMatrixCache`), and fills it with data from the `CostMatrixDataSource` trait. The user is responsible for creating, persisting, and deserializing the cache — screeps-rover does not manage storage.
 
 ### Layer Architecture
 
@@ -362,137 +454,287 @@ CostMatrixOptions {
 
 | Layer | Cache lifetime | Persistence |
 |-------|---------------|-------------|
-| **Structures** | Until room state changes (re-scanned when room is visible) | Serialized to RawMemory segment via `CostMatrixStorage` trait |
-| **Construction sites** | Single tick | Not persisted (rebuilt from game state) |
-| **Creeps** | Single tick | Not persisted (rebuilt from game state) |
-| **Source keeper aggro** | Single tick | Not persisted (rebuilt from game state) |
+| **Structures** | Until room state changes | Serialized in `CostMatrixCache` (user-managed) |
+| **Construction sites** | Single tick | `#[serde(skip)]` — not persisted |
+| **Creeps** | Single tick | `#[serde(skip)]` — not persisted |
+| **Source keeper aggro** | Single tick | `#[serde(skip)]` — not persisted |
 
-Structure caches are persisted because structure layouts change rarely and scanning is expensive. Creep and construction site caches are ephemeral because they change every tick.
+### Persistence
 
-### Custom Storage
-
-The `CostMatrixStorage` trait abstracts persistence:
-
-```rust
-pub trait CostMatrixStorage {
-    fn get_cache(&self, segment: u32) -> Result<CostMatrixCache, String>;
-    fn set_cache(&mut self, segment: u32, data: &CostMatrixCache) -> Result<(), String>;
-}
-```
-
-This allows the consumer to plug in their own storage backend (e.g., RawMemory segments, in-memory cache, etc.).
+`CostMatrixCache` implements `Serialize` and `Deserialize`. The user owns the cache and is responsible for loading it (e.g. from a RawMemory segment) before the tick and saving it afterwards. For offline or single-tick usage, simply create a default cache with `CostMatrixCache::default()` — no storage abstraction needed.
 
 ## Module Reference
 
 | Module | File | Purpose |
 |--------|------|---------|
+| **traits** | `traits.rs` | Trait abstractions: `CreepHandle`, `PathfindingProvider`, `CostMatrixDataSource`, `MovementVisualizer` |
+| **screeps_impl** | `screeps_impl.rs` | *(feature `screeps`)* Real game API implementations: `ScreepsPathfinder`, `ScreepsCostMatrixDataSource`, `ScreepsMovementVisualizer`, `impl CreepHandle for Creep` |
 | **movementsystem** | `movementsystem.rs` | Core movement orchestration: path generation, stuck detection, movement execution, visualization |
 | **resolver** | `resolver.rs` | Global conflict resolution: swap detection, priority assignment, chain shoving |
 | **movementrequest** | `movementrequest.rs` | Request types: `MovementIntent`, `MovementRequest`, builder, priority, anchor constraints |
 | **movementresult** | `movementresult.rs` | Result types: `MovementResult`, `MovementFailure`, `MovementResults` |
-| **costmatrixsystem** | `costmatrixsystem.rs` | Cost matrix management: layer caching, building, lazy evaluation, storage |
+| **costmatrixsystem** | `costmatrixsystem.rs` | Cost matrix management: layer caching, building; operates on user-owned `CostMatrixCache`; uses `CostMatrixDataSource` |
 | **costmatrix** | `costmatrix.rs` | Cost matrix data structures: `SparseCostMatrix`, `LinearCostMatrix`, read/write/apply traits |
 | **location** | `location.rs` | Compact `Location` type: packed `u16` coordinates, distance calculations |
-| **utility** | `utility.rs` | Room traversal rules: novice/respawn/closed zone checks |
+| **utility** | `utility.rs` | Room traversal rules: novice/respawn/closed zone checks, linear distance |
 | **error** | `error.rs` | Error type alias (`MovementError = String`) |
 | **constants** | `constants.rs` | Game constants: Source Keeper name and aggro radius |
 
 ## Integration Guide
 
-### 1. Implement the External Trait
+### Add Dependency
 
-The consumer must implement `MovementSystemExternal<Handle>` to bridge between its entity model and the Screeps API:
+```toml
+[dependencies]
+# For offline testing / simulation (no JS calls):
+screeps-rover = { path = "../screeps-rover" }
+
+# For use in the Screeps game (enables real API implementations):
+screeps-rover = { path = "../screeps-rover", features = ["screeps"] }
+```
+
+### Simple Integration
+
+The quickest way to get started. Uses `ObjectId<Creep>` directly as the handle type and a `HashMap` for movement data storage — no ECS required.
+
+#### 1. Set Up State
 
 ```rust
-pub trait MovementSystemExternal<Handle> {
-    /// Look up the Screeps Creep object for a given entity handle.
-    fn get_creep(&self, entity: &Handle) -> Result<Creep, MovementError>;
+use std::collections::HashMap;
+use screeps::prelude::*;
+use screeps::{Creep, ObjectId};
+use screeps_rover::*;
+use screeps_rover::screeps_impl::*;
 
-    /// Get mutable access to the entity's cached movement data
-    /// (path, stuck state). This is stored/serialized by the consumer.
-    fn get_creep_movement_data(&self, entity: &Handle)
-        -> Result<&mut CreepMovementData, MovementError>;
-
-    /// Room traversal cost for pathfinding. Return None if the room
-    /// is impassable; return Some(cost) otherwise (default: 1.0).
-    fn get_room_cost(&self, from: RoomName, to: RoomName,
-                     options: &RoomOptions) -> Option<f64>;
-
-    /// Position lookup for Follow intents (resolve leader's position).
-    fn get_entity_position(&self, entity: &Handle) -> Option<Position>;
+/// Per-tick movement state. Persist `movement_data` and `cost_matrix_cache`
+/// across ticks (e.g. in Memory or RawMemory segments) for path reuse and
+/// cost matrix caching.
+struct MovementState {
+    movement_data_map: HashMap<ObjectId<Creep>, CreepMovementData>,
+    cost_matrix_cache: CostMatrixCache,
 }
 ```
 
-### 2. Create the Systems
+#### 2. Implement the External Trait
 
 ```rust
-// Create cost matrix system with your storage backend
-let mut cost_matrix_system = CostMatrixSystem::new(
-    Box::new(my_storage),
-    55, // RawMemory segment for structure cache
-);
+struct SimpleExternal<'a> {
+    movement_data_map: &'a mut HashMap<ObjectId<Creep>, CreepMovementData>,
+}
 
-// Create movement system
-let mut movement_system = MovementSystem::new(&mut cost_matrix_system);
-movement_system.set_reuse_path_length(5);
+impl<'a> MovementSystemExternal<ObjectId<Creep>> for SimpleExternal<'a> {
+    type Creep = Creep;
+
+    fn get_creep(&self, id: ObjectId<Creep>) -> Result<Creep, MovementError> {
+        id.resolve().ok_or_else(|| "Creep not found".to_owned())
+    }
+
+    fn get_creep_movement_data(
+        &mut self,
+        id: ObjectId<Creep>,
+    ) -> Result<&mut CreepMovementData, MovementError> {
+        Ok(self.movement_data_map
+            .entry(id)
+            .or_default())
+    }
+
+    // get_room_cost has a default implementation that returns Some(1.0)
+    // for all rooms. Override for smarter room routing.
+
+    fn get_entity_position(&self, id: ObjectId<Creep>) -> Option<Position> {
+        id.resolve().map(|c| c.pos())
+    }
+}
 ```
 
-### 3. Collect Requests
+#### 3. Process Movement Each Tick
 
 ```rust
-let mut movement_data = MovementData::new();
+fn process_movement(state: &mut MovementState) {
+    // Collect movement requests
+    let mut requests = MovementData::new();
 
-// Each job/creep adds its request
-movement_data.move_to(harvester, source_pos).range(1);
-movement_data.move_to(builder, construction_site)
-    .range(3)
-    .anchor(AnchorConstraint { position: work_pos, range: 3 });
-movement_data.follow(carrier, harvester).pull(true);
-movement_data.flee(scout, &flee_targets);
-```
+    for creep in screeps::game::creeps().values() {
+        let id = creep.try_id().unwrap();
+        // Example: move every creep to a target
+        requests.move_to(id, target_pos).range(1);
+    }
 
-### 4. Process and Read Results
+    // Build systems for this tick
+    let mut cost_matrix_system = CostMatrixSystem::new(
+        &mut state.cost_matrix_cache,
+        Box::new(ScreepsCostMatrixDataSource),
+    );
+    let mut pathfinder = ScreepsPathfinder;
+    let mut visualizer = ScreepsMovementVisualizer;
 
-```rust
-let results = movement_system.process(
-    &mut movement_data,
-    &mut external,  // your MovementSystemExternal impl
-);
+    let mut system = MovementSystem::new(
+        &mut cost_matrix_system,
+        &mut pathfinder,
+        Some(&mut visualizer), // or None to disable visualization
+    );
+    system.set_reuse_path_length(5);
 
-for (entity, result) in results.iter() {
-    match result {
-        MovementResult::Moving => { /* on the way */ }
-        MovementResult::Arrived => { /* can do work */ }
-        MovementResult::Stuck { ticks } => { /* waiting */ }
-        MovementResult::Failed(failure) => {
-            match failure {
-                MovementFailure::PathNotFound => { /* reroute */ }
-                MovementFailure::StuckTimeout { ticks } => { /* give up */ }
-                MovementFailure::RoomBlocked => { /* avoid room */ }
-                MovementFailure::InternalError(msg) => { /* log */ }
-            }
+    // Process
+    let mut external = SimpleExternal {
+        movement_data_map: &mut state.movement_data_map,
+    };
+    let results = system.process(&mut external, requests);
+
+    // Handle results
+    for (id, result) in results.results.iter() {
+        match result {
+            MovementResult::Moving => { /* on the way */ }
+            MovementResult::Arrived => { /* can do work */ }
+            MovementResult::Stuck { .. } => { /* waiting */ }
+            MovementResult::Failed(_) => { /* handle failure */ }
         }
     }
 }
 ```
 
-### 5. Persist Movement Data
+That's it. `ObjectId<Creep>` is `Copy + Hash + Eq + Ord + Serialize + Deserialize`, so it satisfies all handle requirements. Persist `movement_data_map` and `cost_matrix_cache` across ticks for path reuse and cost matrix caching.
 
-`CreepMovementData` is serializable. Store it alongside your ECS components so paths and stuck state survive VM reloads:
+### Advanced Integration (ECS)
+
+For larger bots, you'll typically use an ECS (e.g. [specs](https://docs.rs/specs/)) with your own entity type as the handle. This gives you more control over room routing, hostile avoidance, and per-entity storage.
+
+#### 1. Implement the External Trait
+
+With an ECS, the external trait bridges between your entity model and the creep abstraction:
 
 ```rust
-#[derive(Serialize, Deserialize)]
-struct MyCreepComponent {
-    movement_data: CreepMovementData,
-    // ... other fields
+use screeps_rover::*;
+use specs::prelude::*;
+
+struct MyExternal<'a, 'b> {
+    entities: &'b Entities<'a>,
+    creep_owner: &'b ReadStorage<'a, CreepOwner>,
+    creep_movement: &'b mut WriteStorage<'a, MyCreepMovement>,
+    room_data: &'b ReadStorage<'a, RoomData>,
+    mapping: &'b Read<'a, EntityMappingData>,
+}
+
+impl<'a, 'b> MovementSystemExternal<Entity> for MyExternal<'a, 'b> {
+    type Creep = screeps::Creep;
+
+    fn get_creep(&self, entity: Entity) -> Result<screeps::Creep, MovementError> {
+        let owner = self.creep_owner.get(entity)
+            .ok_or("Expected creep owner")?;
+        owner.id().resolve().ok_or("Creep not found".to_owned())
+    }
+
+    fn get_creep_movement_data(
+        &mut self,
+        entity: Entity,
+    ) -> Result<&mut CreepMovementData, MovementError> {
+        // Insert default if missing, then return mutable reference
+        if !self.creep_movement.contains(entity) {
+            let _ = self.creep_movement.insert(entity, MyCreepMovement::default());
+        }
+        self.creep_movement
+            .get_mut(entity)
+            .map(|m| &mut m.0)
+            .ok_or("Failed to get movement data".to_owned())
+    }
+
+    fn get_room_cost(
+        &self,
+        from: RoomName,
+        to: RoomName,
+        options: &RoomOptions,
+    ) -> Option<f64> {
+        // Use room visibility data for smarter routing:
+        // - Return None for impassable/hostile rooms
+        // - Return higher costs for dangerous rooms
+        // - Return lower costs for owned rooms
+        let room_data = self.mapping.get_room(&to)
+            .and_then(|e| self.room_data.get(e));
+
+        match room_data {
+            Some(data) if data.is_hostile() => {
+                match options.hostile_behavior() {
+                    HostileBehavior::Allow => Some(5.0),
+                    HostileBehavior::HighCost => Some(10.0),
+                    HostileBehavior::Deny => None,
+                }
+            }
+            Some(data) if data.is_owned() => Some(1.0),
+            _ => Some(2.0),
+        }
+    }
+
+    fn get_entity_position(&self, entity: Entity) -> Option<Position> {
+        let owner = self.creep_owner.get(entity)?;
+        let creep = owner.id().resolve()?;
+        Some(creep.pos())
+    }
 }
 ```
+
+#### 2. Create the Systems
+
+```rust
+use screeps_rover::*;
+use screeps_rover::screeps_impl::*;
+
+// The user owns the CostMatrixCache as an ECS resource.
+// Load from a RawMemory segment on environment init, or start fresh.
+let cache: CostMatrixCache = load_from_segment(55).unwrap_or_default();
+world.insert(cache);
+```
+
+#### 3. Process Movement in an ECS System
+
+```rust
+fn run(&mut self, mut data: Self::SystemData) {
+    let movement_data = std::mem::take(&mut *data.movement);
+
+    let mut external = MyExternal {
+        entities: &data.entities,
+        creep_owner: &data.creep_owner,
+        creep_movement: &mut data.creep_movement,
+        room_data: &data.room_data,
+        mapping: &data.mapping,
+    };
+
+    let mut cost_matrix_system = CostMatrixSystem::new(
+        &mut data.cost_matrix_cache,
+        Box::new(ScreepsCostMatrixDataSource),
+    );
+    let mut pathfinder = ScreepsPathfinder;
+    let mut visualizer = ScreepsMovementVisualizer;
+
+    let mut system = MovementSystem::new(
+        &mut cost_matrix_system,
+        &mut pathfinder,
+        Some(&mut visualizer), // or None to disable
+    );
+    system.set_reuse_path_length(5);
+
+    *data.movement_results = system.process(&mut external, movement_data);
+}
+```
+
+#### 4. Persist Data
+
+`CostMatrixCache` and `CreepMovementData` are both serializable. Persist them across ticks so paths and structure cost data survive VM reloads:
+
+```rust
+// Serialize the cost matrix cache to a RawMemory segment after the tick:
+save_to_segment(55, &cost_matrix_cache);
+
+// CreepMovementData is stored per-entity in your ECS and serialized
+// alongside other components.
+```
+
+Ephemeral cost matrix layers (creeps, construction sites) are `#[serde(skip)]` and will be rebuilt automatically from the `CostMatrixDataSource` on the next tick.
 
 ## Dependencies
 
 | Crate | Purpose |
 |-------|---------|
-| [screeps-game-api](https://github.com/rustyscreeps/screeps-game-api) | Typed Rust bindings for the Screeps JavaScript API |
+| [screeps-game-api](https://github.com/rustyscreeps/screeps-game-api) | Pure-Rust data types (`Position`, `RoomName`, `Direction`, etc.). JS interop types are only used behind the `screeps` feature. |
 | [screeps-cache](https://github.com/Azaril/screeps-cache) | Lazy evaluation and caching utilities |
 | [serde](https://serde.rs/) | Serialization for path data, cost matrices, and stuck state |
 | [log](https://docs.rs/log/) | Logging facade |

@@ -1,5 +1,5 @@
 use super::costmatrixsystem::*;
-use screeps::*;
+use screeps::local::*;
 use std::hash::Hash;
 
 #[derive(Copy, Clone)]
@@ -74,15 +74,14 @@ pub enum MovementIntent<Handle> {
     },
     /// Follow another entity. The follower's desired next tile is derived
     /// from the leader's resolved movement during the same tick.
-    /// If `pull` is true, the leader will issue `Creep::pull(follower)` and the
-    /// follower will issue `Creep::move_pulled_by(leader)`, allowing fatigued
-    /// creeps to move with the group.
+    /// If `pull` is true, the leader will issue pull and the follower will
+    /// issue move_pulled_by, allowing fatigued creeps to move with the group.
     Follow {
         target: Handle,
         range: u32,
         pull: bool,
     },
-    /// Flee from one or more targets. Uses `pathfinder::search` with `flee: true`.
+    /// Flee from one or more targets.
     Flee {
         targets: Vec<FleeTarget>,
         range: u32,
@@ -93,7 +92,7 @@ pub struct MovementRequest<Handle> {
     pub(crate) intent: MovementIntent<Handle>,
     pub(crate) room_options: Option<RoomOptions>,
     pub(crate) cost_matrix_options: Option<CostMatrixOptions>,
-    pub(crate) visualization: Option<PolyStyle>,
+    pub(crate) visualize: bool,
     pub(crate) priority: MovementPriority,
     pub(crate) allow_shove: bool,
     pub(crate) allow_swap: bool,
@@ -109,7 +108,7 @@ impl<Handle> MovementRequest<Handle> {
             },
             room_options: None,
             cost_matrix_options: None,
-            visualization: None,
+            visualize: true,
             priority: MovementPriority::default(),
             allow_shove: true,
             allow_swap: true,
@@ -126,7 +125,7 @@ impl<Handle> MovementRequest<Handle> {
             },
             room_options: None,
             cost_matrix_options: None,
-            visualization: None,
+            visualize: true,
             priority: MovementPriority::default(),
             allow_shove: true,
             allow_swap: true,
@@ -139,7 +138,7 @@ impl<Handle> MovementRequest<Handle> {
             intent: MovementIntent::Flee { targets, range: 5 },
             room_options: None,
             cost_matrix_options: None,
-            visualization: None,
+            visualize: true,
             priority: MovementPriority::High,
             allow_shove: false,
             allow_swap: true,
@@ -192,8 +191,7 @@ impl<'a, Handle> MovementRequestBuilder<'a, Handle> {
         self
     }
 
-    /// Enable pull mechanics for Follow intents. The leader will issue
-    /// `Creep::pull(follower)` and the follower will use `Creep::move_pulled_by(leader)`.
+    /// Enable pull mechanics for Follow intents.
     pub fn pull(&mut self, enable: bool) -> &mut Self {
         if let MovementIntent::Follow {
             pull: ref mut p, ..
@@ -217,8 +215,8 @@ impl<'a, Handle> MovementRequestBuilder<'a, Handle> {
         self
     }
 
-    pub fn visualization(&mut self, style: PolyStyle) -> &mut Self {
-        self.request.visualization = Some(style);
+    pub fn visualize(&mut self, enable: bool) -> &mut Self {
+        self.request.visualize = enable;
 
         self
     }
@@ -241,8 +239,7 @@ impl<'a, Handle> MovementRequestBuilder<'a, Handle> {
         self
     }
 
-    /// Set an anchor constraint. When shoved or swapped, the creep will only
-    /// accept a destination within `constraint.range` of `constraint.position`.
+    /// Set an anchor constraint.
     pub fn anchor(&mut self, constraint: AnchorConstraint) -> &mut Self {
         self.request.anchor = Some(constraint);
 

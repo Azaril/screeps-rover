@@ -6,6 +6,12 @@ edition = "2021"
 
 [features]
 default = []
+## Enable the `screeps` feature to get real game API implementations of the
+## abstraction traits (pathfinding, creep actions, cost-matrix data source,
+## visualization). Without this feature the crate compiles and runs on native
+## targets for offline testing — only pure-Rust data types from screeps-game-api
+## are used and no JS interop functions are called.
+screeps = []
 profile = ["screeps-timing", "screeps-timing-annotate"]
 
 [dependencies]

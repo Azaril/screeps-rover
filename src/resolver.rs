@@ -1,5 +1,6 @@
 use super::movementrequest::*;
-use screeps::*;
+use screeps::constants::Direction;
+use screeps::local::*;
 use std::collections::HashMap;
 use std::hash::Hash;
 
