@@ -62,11 +62,12 @@ pub struct CostMatrixCache {
 }
 
 impl CostMatrixCache {
-    /// Clear ephemeral per-tick data (construction sites, creeps) from all
+    /// Clear ephemeral per-tick data (structures, construction sites, creeps) from all
     /// rooms. Call this at the start of each tick so stale data is not reused.
-    /// Persisted data (structures) is retained.
+    //TODO: Need to add cache eviction policy instead to save computation.
     pub fn clear_ephemeral(&mut self) {
         for entry in self.rooms.values_mut() {
+            entry.structures = None;
             entry.construction_sites = None;
             entry.creeps = None;
         }
