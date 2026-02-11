@@ -405,11 +405,3 @@ impl MovementVisualizer for ScreepsMovementVisualizer {
     }
 }
 
-// --- Room traversal using live game API ---
-
-/// Check if two rooms can be traversed between using live game API room status.
-pub fn can_traverse_between_rooms_live(from: RoomName, to: RoomName) -> bool {
-    let from_status = game::map::get_room_status(from).map(|r| r.status());
-    let to_status = game::map::get_room_status(to).map(|r| r.status());
-    super::utility::can_traverse_between_room_status(from_status, to_status)
-}
