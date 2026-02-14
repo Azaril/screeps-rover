@@ -323,6 +323,7 @@ where
                     target,
                     range,
                     pull,
+                    desired_offset,
                 } => {
                     if *pull {
                         pull_pairs.insert(*entity, *target);
@@ -354,6 +355,7 @@ where
                             creep_pos,
                             *target,
                             *range,
+                            *desired_offset,
                             request,
                             &leader_moves,
                         )
@@ -715,6 +717,15 @@ where
     }
 
     /// Compute the next step for a Follow intent.
+    ///
+    /// When `desired_offset` is `Some((dx, dy))`, the follower prefers the
+    /// tile at `(leader_new_pos + offset)` instead of the leader's vacated
+    /// tile.  This lets quad members maintain a 2×2 formation: each follower
+    /// has a unique offset so they don't all compete for the same tile.
+    ///
+    /// If the offset tile is unreachable in one step (or out of bounds), the
+    /// follower falls back to the default behaviour (vacated tile or
+    /// pathfinding toward the leader).
     #[allow(clippy::too_many_arguments)]
     fn compute_next_step_for_follow<S>(
         &mut self,
@@ -723,6 +734,7 @@ where
         creep_pos: Position,
         target: Handle,
         range: u32,
+        desired_offset: Option<(i32, i32)>,
         request: &MovementRequest<Handle>,
         leader_moves: &HashMap<Handle, (Position, Option<Position>)>,
     ) -> Result<Option<Position>, MovementFailure>
@@ -742,6 +754,32 @@ where
         };
 
         let leader_is_moving = leader_new_pos.is_some() && leader_new_pos != Some(leader_old_pos);
+        let leader_dest = leader_new_pos.unwrap_or(leader_old_pos);
+
+        // If a desired offset is set, try to reach the offset tile relative
+        // to the leader's destination.  This is the primary mechanism for
+        // maintaining a 2×2 quad shape.
+        if let Some((dx, dy)) = desired_offset {
+            if let Ok(offset_pos) = leader_dest.checked_add((dx, dy)) {
+                // Already at the desired position – stay put.
+                if creep_pos == offset_pos {
+                    return Ok(None);
+                }
+
+                // If the offset tile is one step away, move there directly.
+                if creep_pos.get_range_to(offset_pos) <= 1
+                    && creep_pos.room_name() == offset_pos.room_name()
+                {
+                    return Ok(Some(offset_pos));
+                }
+
+                // Otherwise pathfind toward the offset tile.
+                return self.compute_next_step_for_move_to(
+                    external, entity, creep_pos, offset_pos, 0, request,
+                );
+            }
+            // Offset out of bounds – fall through to default behaviour.
+        }
 
         if leader_is_moving {
             let vacated_tile = leader_old_pos;
@@ -752,7 +790,6 @@ where
                 }
                 return Ok(Some(vacated_tile));
             }
-            let leader_dest = leader_new_pos.unwrap_or(leader_old_pos);
             self.compute_next_step_for_move_to(external, entity, creep_pos, leader_dest, range, request)
         } else {
             if creep_pos.get_range_to(leader_old_pos) <= range {

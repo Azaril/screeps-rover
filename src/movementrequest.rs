@@ -76,10 +76,16 @@ pub enum MovementIntent<Handle> {
     /// from the leader's resolved movement during the same tick.
     /// If `pull` is true, the leader will issue pull and the follower will
     /// issue move_pulled_by, allowing fatigued creeps to move with the group.
+    /// If `desired_offset` is set, the follower prefers the tile at that
+    /// (dx, dy) offset from the leader's new position. This is computed
+    /// *after* the leader's move is resolved (topological sort ensures this).
+    /// If the offset tile is blocked, the follower falls back to any tile
+    /// within `range` of the leader.
     Follow {
         target: Handle,
         range: u32,
         pull: bool,
+        desired_offset: Option<(i32, i32)>,
     },
     /// Flee from one or more targets.
     Flee {
@@ -122,6 +128,7 @@ impl<Handle> MovementRequest<Handle> {
                 target,
                 range: 1,
                 pull: false,
+                desired_offset: None,
             },
             room_options: None,
             cost_matrix_options: None,
@@ -198,6 +205,23 @@ impl<'a, Handle> MovementRequestBuilder<'a, Handle> {
         } = &mut self.request.intent
         {
             *p = enable;
+        }
+
+        self
+    }
+
+    /// Set a desired offset from the follow target's position.
+    /// When the leader moves, the follower will prefer the tile at
+    /// (leader_new_pos.x + dx, leader_new_pos.y + dy) rather than
+    /// the leader's vacated tile. Falls back to any tile within range
+    /// if the offset tile is blocked or out of bounds.
+    pub fn desired_offset(&mut self, dx: i32, dy: i32) -> &mut Self {
+        if let MovementIntent::Follow {
+            desired_offset: ref mut o,
+            ..
+        } = &mut self.request.intent
+        {
+            *o = Some((dx, dy));
         }
 
         self
