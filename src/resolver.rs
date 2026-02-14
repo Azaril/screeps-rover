@@ -4,8 +4,8 @@ use screeps::local::*;
 use std::collections::HashMap;
 use std::hash::Hash;
 
-/// Maximum depth for shove chains to prevent unbounded recursion.
-const MAX_SHOVE_DEPTH: u32 = 3;
+/// Default maximum depth for shove chains to prevent unbounded recursion.
+pub(crate) const DEFAULT_MAX_SHOVE_DEPTH: u32 = 10;
 
 /// Tracks per-creep state during a single tick of resolution.
 #[derive(Clone)]
@@ -160,6 +160,7 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
     creeps: &mut HashMap<Handle, ResolvedCreep<Handle>>,
     idle_creep_positions: &HashMap<Position, Handle>,
     is_tile_walkable: &dyn Fn(Position) -> bool,
+    max_shove_depth: u32,
 ) {
     // Step 1: Detect and resolve swaps first.
     resolve_swaps(creeps);
@@ -324,7 +325,14 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
         if let Some(occupant) = find_occupant(tile) {
             if occupant != winner_handle {
                 // The tile is occupied. Try to shove the occupant away.
-                let shoved = try_shove(occupant, creeps, idle_creep_positions, is_tile_walkable, 0);
+                let shoved = try_shove(
+                    occupant,
+                    creeps,
+                    idle_creep_positions,
+                    is_tile_walkable,
+                    0,
+                    max_shove_depth,
+                );
                 if !shoved {
                     winner_can_move = false;
                 }
@@ -428,15 +436,16 @@ fn resolve_swaps<Handle: Hash + Eq + Copy + Ord>(
 /// Try to shove a creep out of the way. Returns true if successful.
 ///
 /// Supports chain-shoving: if all adjacent tiles are occupied, it will
-/// recursively attempt to shove occupants up to `MAX_SHOVE_DEPTH` levels deep.
+/// recursively attempt to shove occupants up to `max_shove_depth` levels deep.
 fn try_shove<Handle: Hash + Eq + Copy + Ord>(
     entity: Handle,
     creeps: &mut HashMap<Handle, ResolvedCreep<Handle>>,
     idle_creep_positions: &HashMap<Position, Handle>,
     is_tile_walkable: &dyn Fn(Position) -> bool,
     depth: u32,
+    max_shove_depth: u32,
 ) -> bool {
-    if depth >= MAX_SHOVE_DEPTH {
+    if depth >= max_shove_depth {
         return false;
     }
 
@@ -506,6 +515,7 @@ fn try_shove<Handle: Hash + Eq + Copy + Ord>(
                             idle_creep_positions,
                             is_tile_walkable,
                             depth + 1,
+                            max_shove_depth,
                         )
                     } else {
                         true
@@ -562,6 +572,7 @@ fn try_shove<Handle: Hash + Eq + Copy + Ord>(
                 idle_creep_positions,
                 is_tile_walkable,
                 depth + 1,
+                max_shove_depth,
             );
             if !chain_shoved {
                 continue; // Can't free this tile, try next direction.

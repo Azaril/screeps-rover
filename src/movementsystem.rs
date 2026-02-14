@@ -226,6 +226,7 @@ pub struct MovementSystem<'a, Handle> {
     pathfinder: &'a mut dyn PathfindingProvider,
     visualizer: Option<&'a mut dyn MovementVisualizer>,
     reuse_path_length: u32,
+    max_shove_depth: u32,
     phantom: std::marker::PhantomData<Handle>,
 }
 
@@ -244,12 +245,17 @@ where
             pathfinder,
             visualizer,
             reuse_path_length: 5,
+            max_shove_depth: DEFAULT_MAX_SHOVE_DEPTH,
             phantom: std::marker::PhantomData,
         }
     }
 
     pub fn set_reuse_path_length(&mut self, length: u32) {
         self.reuse_path_length = length;
+    }
+
+    pub fn set_max_shove_depth(&mut self, depth: u32) {
+        self.max_shove_depth = depth;
     }
 
     /// Global movement resolution with conflict detection, shove/swap, and follow support.
@@ -424,6 +430,7 @@ where
             &mut resolved_creeps,
             &idle_creep_positions,
             &is_tile_walkable,
+            self.max_shove_depth,
         );
 
         // --- Pass 3: Execute movement and record results ---
