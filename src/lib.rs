@@ -25,8 +25,6 @@ pub use movementsystem::*;
 // conflicts with `screeps::HasPosition::pos()`. Access it via `screeps_rover::traits::CreepHandle`
 // or `screeps_rover::CreepHandle` when needed explicitly.
 pub use traits::{
-    CostMatrixDataSource,
-    PathfindingProvider, PathfindingResult, RouteStep,
-    MovementVisualizer,
+    CostMatrixDataSource, MovementVisualizer, PathfindingProvider, PathfindingResult, RouteStep,
 };
 pub use utility::*;

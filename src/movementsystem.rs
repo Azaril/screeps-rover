@@ -175,11 +175,7 @@ where
             .into()
     }
 
-    pub fn follow(
-        &mut self,
-        entity: Handle,
-        target: Handle,
-    ) -> MovementRequestBuilder<'_, Handle> {
+    pub fn follow(&mut self, entity: Handle, target: Handle) -> MovementRequestBuilder<'_, Handle> {
         self.requests
             .entry(entity)
             .and_modify(|e| *e = MovementRequest::follow(target))
@@ -340,12 +336,7 @@ where
                             Ok(None)
                         } else {
                             self.compute_next_step_for_move_to(
-                                external,
-                                *entity,
-                                creep_pos,
-                                target_pos,
-                                *range,
-                                request,
+                                external, *entity, creep_pos, target_pos, *range, request,
                             )
                         }
                     } else {
@@ -362,12 +353,7 @@ where
                     }
                 }
                 MovementIntent::Flee { targets, range } => {
-                    self.compute_next_step_for_flee(
-                        creep_pos,
-                        targets,
-                        *range,
-                        request,
-                    )
+                    self.compute_next_step_for_flee(creep_pos, targets, *range, request)
                 }
             };
 
@@ -432,11 +418,13 @@ where
         let idle_creep_positions: HashMap<Position, Handle> = HashMap::new();
 
         let pathfinder = &mut *self.pathfinder;
-        let is_tile_walkable = |pos: Position| -> bool {
-            pathfinder.is_tile_walkable(pos)
-        };
+        let is_tile_walkable = |pos: Position| -> bool { pathfinder.is_tile_walkable(pos) };
 
-        resolve_conflicts(&mut resolved_creeps, &idle_creep_positions, &is_tile_walkable);
+        resolve_conflicts(
+            &mut resolved_creeps,
+            &idle_creep_positions,
+            &is_tile_walkable,
+        );
 
         // --- Pass 3: Execute movement and record results ---
         for (entity, resolved) in &resolved_creeps {
@@ -474,12 +462,7 @@ where
                     1
                 };
 
-                results.insert(
-                    *entity,
-                    MovementResult::Stuck {
-                        ticks: stuck_ticks,
-                    },
-                );
+                results.insert(*entity, MovementResult::Stuck { ticks: stuck_ticks });
                 continue;
             }
 
@@ -505,27 +488,23 @@ where
                 }
             }
 
-            let direction = resolved
-                .current_pos
-                .get_direction_to(resolved.final_pos);
+            let direction = resolved.current_pos.get_direction_to(resolved.final_pos);
 
             match direction {
-                Some(dir) => {
-                    match creep.move_direction(dir) {
-                        Ok(()) => {
-                            results.insert(*entity, MovementResult::Moving);
-                        }
-                        Err(e) => {
-                            results.insert(
-                                *entity,
-                                MovementResult::Failed(MovementFailure::InternalError(format!(
-                                    "move_direction error: {:?}",
-                                    e
-                                ))),
-                            );
-                        }
+                Some(dir) => match creep.move_direction(dir) {
+                    Ok(()) => {
+                        results.insert(*entity, MovementResult::Moving);
                     }
-                }
+                    Err(e) => {
+                        results.insert(
+                            *entity,
+                            MovementResult::Failed(MovementFailure::InternalError(format!(
+                                "move_direction error: {:?}",
+                                e
+                            ))),
+                        );
+                    }
+                },
                 None => {
                     results.insert(*entity, MovementResult::Moving);
                 }
@@ -537,12 +516,7 @@ where
             for entity in sorted_entities.iter() {
                 if let Some(request) = data.requests.get(entity) {
                     let result = results.get(entity);
-                    self.visualize_entity(
-                        external,
-                        *entity,
-                        request,
-                        result,
-                    );
+                    self.visualize_entity(external, *entity, request, result);
                 }
             }
         }
@@ -570,8 +544,7 @@ where
                 .map_err(MovementFailure::InternalError)?;
 
             if let Some(path_data) = &mut creep_data.path_data {
-                let dest_matches =
-                    path_data.destination == destination && path_data.range == range;
+                let dest_matches = path_data.destination == destination && path_data.range == range;
 
                 if !dest_matches {
                     creep_data.path_data = None;
@@ -743,14 +716,14 @@ where
     {
         let (leader_old_pos, leader_new_pos) = match leader_moves.get(&target) {
             Some(positions) => *positions,
-            None => {
-                match external.get_entity_position(target) {
-                    Some(pos) => (pos, None),
-                    None => return Err(MovementFailure::InternalError(
+            None => match external.get_entity_position(target) {
+                Some(pos) => (pos, None),
+                None => {
+                    return Err(MovementFailure::InternalError(
                         "Follow target entity not found".to_owned(),
-                    )),
+                    ))
                 }
-            }
+            },
         };
 
         let leader_is_moving = leader_new_pos.is_some() && leader_new_pos != Some(leader_old_pos);
@@ -790,7 +763,14 @@ where
                 }
                 return Ok(Some(vacated_tile));
             }
-            self.compute_next_step_for_move_to(external, entity, creep_pos, leader_dest, range, request)
+            self.compute_next_step_for_move_to(
+                external,
+                entity,
+                creep_pos,
+                leader_dest,
+                range,
+                request,
+            )
         } else {
             if creep_pos.get_range_to(leader_old_pos) <= range {
                 return Ok(None);
@@ -826,10 +806,7 @@ where
             return Ok(None);
         }
 
-        let goals: Vec<(Position, u32)> = targets
-            .iter()
-            .map(|t| (t.pos, t.range))
-            .collect();
+        let goals: Vec<(Position, u32)> = targets.iter().map(|t| (t.pos, t.range)).collect();
 
         let cost_matrix_options = request.cost_matrix_options.unwrap_or_default();
         let cost_matrix_system = &mut self.cost_matrix_system;
@@ -876,18 +853,23 @@ where
         let room_options = request.room_options.unwrap_or_default();
         let destination_room = destination.room_name();
 
-        let room_path = self.pathfinder.find_route(
-            creep_room_name,
-            destination.room_name(),
-            &|to_room_name, from_room_name| {
-                external
-                    .get_room_cost(from_room_name, to_room_name, &room_options)
-                    .unwrap_or(f64::INFINITY)
-            },
-        )
-        .map_err(|e| {
-            MovementFailure::InternalError(format!("Could not find path between rooms: {:?}", e))
-        })?;
+        let room_path = self
+            .pathfinder
+            .find_route(
+                creep_room_name,
+                destination.room_name(),
+                &|to_room_name, from_room_name| {
+                    external
+                        .get_room_cost(from_room_name, to_room_name, &room_options)
+                        .unwrap_or(f64::INFINITY)
+                },
+            )
+            .map_err(|e| {
+                MovementFailure::InternalError(format!(
+                    "Could not find path between rooms: {:?}",
+                    e
+                ))
+            })?;
 
         let room_names: HashSet<_> = room_path
             .iter()

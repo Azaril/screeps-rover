@@ -16,6 +16,7 @@ profile = ["screeps-timing", "screeps-timing-annotate"]
 
 [dependencies]
 screeps-game-api = "0.23"
+screeps-common = { git = "https://github.com/Azaril/screeps-common", features = ["screeps"] }
 screeps-cache = { git = "https://github.com/Azaril/screeps-cache" }
 screeps-timing = { git = "https://github.com/Azaril/screeps-timing", optional = true }
 screeps-timing-annotate = { git = "https://github.com/Azaril/screeps-timing-annotate", optional = true }

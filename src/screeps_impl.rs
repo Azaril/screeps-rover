@@ -125,10 +125,7 @@ impl PathfindingProvider for ScreepsPathfinder {
         let result = game::map::find_route(
             from,
             to,
-            Some(
-                FindRouteOptions::new()
-                    .room_callback(room_callback),
-            ),
+            Some(FindRouteOptions::new().room_callback(room_callback)),
         )
         .map_err(|e| format!("find_route error: {:?}", e))?;
 
@@ -222,11 +219,7 @@ impl CostMatrixDataSource for ScreepsCostMatrixDataSource {
             }
         }
 
-        let safe_mode = room
-            .controller()
-            .and_then(|c| c.safe_mode())
-            .unwrap_or(0)
-            > 0;
+        let safe_mode = room.controller().and_then(|c| c.safe_mode()).unwrap_or(0) > 0;
 
         for construction_site in room.find(find::HOSTILE_CONSTRUCTION_SITES, None).iter() {
             let pos = construction_site.pos();
@@ -347,9 +340,7 @@ impl MovementVisualizer for ScreepsMovementVisualizer {
         let ax = anchor_pos.x().u8() as f32;
         let ay = anchor_pos.y().u8() as f32;
         if (ax - cx).abs() > 0.01 || (ay - cy).abs() > 0.01 {
-            let line_style = screeps::LineStyle::default()
-                .color("#ff8800")
-                .opacity(0.25);
+            let line_style = screeps::LineStyle::default().color("#ff8800").opacity(0.25);
             visual.line((cx, cy), (ax, ay), Some(line_style));
         }
     }
@@ -360,9 +351,7 @@ impl MovementVisualizer for ScreepsMovementVisualizer {
         let cx = creep_pos.x().u8() as f32;
         let cy = creep_pos.y().u8() as f32;
         let d = 0.15;
-        let style = screeps::LineStyle::default()
-            .color("#ff4444")
-            .opacity(0.6);
+        let style = screeps::LineStyle::default().color("#ff4444").opacity(0.6);
         visual.line((cx - d, cy - d), (cx + d, cy + d), Some(style.clone()));
         visual.line((cx - d, cy + d), (cx + d, cy - d), Some(style));
     }
@@ -404,4 +393,3 @@ impl MovementVisualizer for ScreepsMovementVisualizer {
         visual.circle(cx, cy, Some(circle_style));
     }
 }
-

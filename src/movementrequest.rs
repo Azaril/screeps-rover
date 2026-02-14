@@ -68,10 +68,7 @@ pub struct AnchorConstraint {
 /// Describes the semantic movement goal for a creep.
 pub enum MovementIntent<Handle> {
     /// Move to a fixed position within range. Standard pathfinding.
-    MoveTo {
-        destination: Position,
-        range: u32,
-    },
+    MoveTo { destination: Position, range: u32 },
     /// Follow another entity. The follower's desired next tile is derived
     /// from the leader's resolved movement during the same tick.
     /// If `pull` is true, the leader will issue pull and the follower will

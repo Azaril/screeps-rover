@@ -324,13 +324,7 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
         if let Some(occupant) = find_occupant(tile) {
             if occupant != winner_handle {
                 // The tile is occupied. Try to shove the occupant away.
-                let shoved = try_shove(
-                    occupant,
-                    creeps,
-                    idle_creep_positions,
-                    is_tile_walkable,
-                    0,
-                );
+                let shoved = try_shove(occupant, creeps, idle_creep_positions, is_tile_walkable, 0);
                 if !shoved {
                     winner_can_move = false;
                 }

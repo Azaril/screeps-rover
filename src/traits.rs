@@ -75,7 +75,10 @@ pub struct RouteStep {
 /// concern.
 pub trait CostMatrixDataSource {
     fn get_structure_costs(&self, room_name: RoomName) -> Option<StuctureCostMatrixCache>;
-    fn get_construction_site_costs(&self, room_name: RoomName) -> Option<ConstructionSiteCostMatrixCache>;
+    fn get_construction_site_costs(
+        &self,
+        room_name: RoomName,
+    ) -> Option<ConstructionSiteCostMatrixCache>;
     fn get_creep_costs(&self, room_name: RoomName) -> Option<CreepCostMatrixCache>;
 }
 

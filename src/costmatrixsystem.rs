@@ -121,10 +121,7 @@ impl<'a> CostMatrixSystem<'a> {
         cache: &'a mut CostMatrixCache,
         data_source: Box<dyn CostMatrixDataSource>,
     ) -> CostMatrixSystem<'a> {
-        CostMatrixSystem {
-            cache,
-            data_source,
-        }
+        CostMatrixSystem { cache, data_source }
     }
 
     /// Build a `LocalCostMatrix` (Rust-native) for a room with the given options.
@@ -256,5 +253,3 @@ impl CostMatrixCache {
         Ok(lcm)
     }
 }
-
-
