@@ -7,6 +7,100 @@ use std::hash::Hash;
 /// Default maximum depth for shove chains to prevent unbounded recursion.
 pub(crate) const DEFAULT_MAX_SHOVE_DEPTH: u32 = 10;
 
+/// Context about the creep initiating a shove, passed through the chain so
+/// every level can compare its priority and stuck state against the occupant.
+#[derive(Clone, Copy)]
+struct ShoveContext {
+    /// Priority of the original creep that wants the tile.
+    priority: MovementPriority,
+    /// How many ticks the original creep has been stuck (immobile).
+    stuck_ticks: u32,
+}
+
+/// Try local avoidance: find an adjacent tile the creep can step to that keeps
+/// it close to its intended path. This avoids wasting ticks waiting for stuck
+/// escalation when a higher-priority creep is blocking the desired tile.
+///
+/// Returns `Some(position)` if a suitable avoidance tile is found.
+///
+/// A tile qualifies if it is:
+/// 1. Adjacent to the creep's current position (1 step away).
+/// 2. Walkable terrain.
+/// 3. Not firmly occupied by a resolved creep.
+/// 4. Not occupied by an unresolved creep (we don't chain-shove for avoidance).
+/// 5. Adjacent to the blocked tile (range <= 1), so the creep can resume its
+///    path next tick — this limits the detour to at most 1 extra tick.
+///
+/// Among qualifying tiles, prefer the one closest to the blocked tile (range 1
+/// is a lateral step; range 0 would be the blocked tile itself, excluded).
+fn try_local_avoidance<Handle: Hash + Eq + Copy>(
+    creep_pos: Position,
+    blocked_tile: Position,
+    firmly_occupied: &std::collections::HashSet<Position>,
+    current_pos_to_entity: &HashMap<Position, Handle>,
+    idle_creep_positions: &HashMap<Position, Handle>,
+    is_tile_walkable: &dyn Fn(Position) -> bool,
+) -> Option<Position> {
+    let mut best: Option<(Position, u32)> = None;
+
+    for direction in Direction::iter() {
+        let offset = direction.into_offset();
+        let nx = creep_pos.x().u8() as i32 + offset.0;
+        let ny = creep_pos.y().u8() as i32 + offset.1;
+
+        if !(1..=48).contains(&nx) || !(1..=48).contains(&ny) {
+            continue;
+        }
+
+        let candidate = Position::new(
+            RoomCoordinate::new(nx as u8).unwrap(),
+            RoomCoordinate::new(ny as u8).unwrap(),
+            creep_pos.room_name(),
+        );
+
+        // Skip the blocked tile itself — that's the whole reason we're here.
+        if candidate == blocked_tile {
+            continue;
+        }
+
+        if !is_tile_walkable(candidate) {
+            continue;
+        }
+
+        if firmly_occupied.contains(&candidate) {
+            continue;
+        }
+
+        // Don't try to displace anyone for avoidance — only use truly empty tiles.
+        if current_pos_to_entity.contains_key(&candidate) {
+            continue;
+        }
+        if idle_creep_positions.contains_key(&candidate) {
+            continue;
+        }
+
+        // Must be adjacent to the blocked tile so the creep can resume its
+        // path next tick (at most 1 tick detour).
+        let dist_to_blocked = candidate.get_range_to(blocked_tile);
+        if dist_to_blocked > 1 {
+            continue;
+        }
+
+        // Prefer tiles closer to the blocked tile (lateral steps).
+        match best {
+            Some((_, best_dist)) if dist_to_blocked < best_dist => {
+                best = Some((candidate, dist_to_blocked));
+            }
+            None => {
+                best = Some((candidate, dist_to_blocked));
+            }
+            _ => {}
+        }
+    }
+
+    best.map(|(pos, _)| pos)
+}
+
 /// Tracks per-creep state during a single tick of resolution.
 #[derive(Clone)]
 pub(crate) struct ResolvedCreep<Handle: Hash + Eq + Copy> {
@@ -321,10 +415,18 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
 
         // Check if the target tile is occupied by another creep.
         let mut winner_can_move = true;
+        let mut avoidance_tile: Option<Position> = None;
 
         if let Some(occupant) = find_occupant(tile) {
             if occupant != winner_handle {
+                let winner_creep = &creeps[&winner_handle];
+                let shover = ShoveContext {
+                    priority: winner_creep.priority,
+                    stuck_ticks: winner_creep.stuck_ticks,
+                };
                 // The tile is occupied. Try to shove the occupant away.
+                // Pass the winner's priority and stuck_ticks so try_shove can
+                // decide whether the shove is justified.
                 let shoved = try_shove(
                     occupant,
                     creeps,
@@ -332,17 +434,41 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
                     is_tile_walkable,
                     0,
                     max_shove_depth,
+                    shover,
                 );
                 if !shoved {
-                    winner_can_move = false;
+                    // Shove was denied (likely priority gate). Before giving up
+                    // and leaving the winner stuck, try local avoidance: find an
+                    // adjacent walkable tile that keeps the winner close to its
+                    // path so it can resume next tick with at most 1 tick detour.
+                    let winner_creep = &creeps[&winner_handle];
+                    let firmly_occupied: std::collections::HashSet<Position> = creeps
+                        .values()
+                        .filter(|c| c.resolved)
+                        .map(|c| c.final_pos)
+                        .collect();
+
+                    avoidance_tile = try_local_avoidance(
+                        winner_creep.current_pos,
+                        *tile,
+                        &firmly_occupied,
+                        &current_pos_to_entity,
+                        idle_creep_positions,
+                        is_tile_walkable,
+                    );
+
+                    if avoidance_tile.is_none() {
+                        winner_can_move = false;
+                    }
                 }
             }
         }
 
         if winner_can_move {
+            let final_pos = avoidance_tile.unwrap_or(*tile);
             let winner_creep = creeps.get_mut(&winner_handle).unwrap();
             winner_creep.resolved = true;
-            winner_creep.final_pos = *tile;
+            winner_creep.final_pos = final_pos;
         }
     }
 
@@ -435,6 +561,13 @@ fn resolve_swaps<Handle: Hash + Eq + Copy + Ord>(
 
 /// Try to shove a creep out of the way. Returns true if successful.
 ///
+/// `shover_priority` is the priority of the creep that wants the tile. A shove
+/// is only attempted when the shover's priority is strictly greater than the
+/// occupant's priority, OR when the shover has been stuck long enough that no
+/// alternative path exists (`shover_stuck_ticks >= STUCK_SHOVE_THRESHOLD`).
+/// This prevents low-priority creeps from casually displacing high-priority
+/// stationed creeps (e.g. miners) when they could simply path around.
+///
 /// Supports chain-shoving: if all adjacent tiles are occupied, it will
 /// recursively attempt to shove occupants up to `max_shove_depth` levels deep.
 fn try_shove<Handle: Hash + Eq + Copy + Ord>(
@@ -444,7 +577,13 @@ fn try_shove<Handle: Hash + Eq + Copy + Ord>(
     is_tile_walkable: &dyn Fn(Position) -> bool,
     depth: u32,
     max_shove_depth: u32,
+    shover: ShoveContext,
 ) -> bool {
+    /// Minimum stuck ticks before a lower-or-equal priority creep is allowed
+    /// to shove a higher-priority occupant. This gives the pathfinder time to
+    /// find an alternative route before resorting to displacement.
+    const STUCK_SHOVE_THRESHOLD: u32 = 5;
+
     if depth >= max_shove_depth {
         return false;
     }
@@ -459,6 +598,13 @@ fn try_shove<Handle: Hash + Eq + Copy + Ord>(
     }
 
     if creep.priority == MovementPriority::Immovable {
+        return false;
+    }
+
+    // Only shove if the shover outranks the occupant, or has been stuck long
+    // enough that no alternative path exists. This prevents casual displacement
+    // of stationed miners by passing haulers.
+    if shover.priority <= creep.priority && shover.stuck_ticks < STUCK_SHOVE_THRESHOLD {
         return false;
     }
 
@@ -516,6 +662,7 @@ fn try_shove<Handle: Hash + Eq + Copy + Ord>(
                             is_tile_walkable,
                             depth + 1,
                             max_shove_depth,
+                            shover,
                         )
                     } else {
                         true
@@ -573,6 +720,7 @@ fn try_shove<Handle: Hash + Eq + Copy + Ord>(
                 is_tile_walkable,
                 depth + 1,
                 max_shove_depth,
+                shover,
             );
             if !chain_shoved {
                 continue; // Can't free this tile, try next direction.
