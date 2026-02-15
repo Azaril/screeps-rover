@@ -248,8 +248,11 @@ pub(crate) fn topological_sort_follows<Handle: Hash + Eq + Copy>(
 ///    map (current_pos -> entity) for all unresolved creeps.
 /// 3. For each contested tile, the highest priority creep wins. If the tile is
 ///    currently occupied by another creep (whether that creep is moving, idle, or
-///    stationary), attempt to shove the occupant out of the way.
-/// 4. Mark remaining unresolved creeps as staying in place.
+///    stationary), attempt to shove the occupant out of the way. If the shove
+///    fails, the winner tries local avoidance.
+/// 4. Losing candidates (lower-priority creeps that also wanted the same tile)
+///    are offered local avoidance so they can side-step rather than stand still.
+/// 5. Mark remaining unresolved creeps as staying in place.
 pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
     creeps: &mut HashMap<Handle, ResolvedCreep<Handle>>,
     idle_creep_positions: &HashMap<Position, Handle>,
@@ -469,6 +472,42 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
             let winner_creep = creeps.get_mut(&winner_handle).unwrap();
             winner_creep.resolved = true;
             winner_creep.final_pos = final_pos;
+        }
+
+        // Losers: other candidates that wanted this same tile but lost the
+        // priority contest. Try local avoidance for each so they can side-step
+        // instead of wasting a tick standing still.
+        let losers: Vec<Handle> = candidates
+            .iter()
+            .filter(|h| **h != winner_handle && !creeps[*h].resolved)
+            .copied()
+            .collect();
+
+        for loser_handle in losers {
+            let loser_creep = &creeps[&loser_handle];
+            let loser_pos = loser_creep.current_pos;
+            let blocked = *tile;
+
+            // Rebuild firmly_occupied each time since prior losers may have
+            // been resolved to avoidance tiles.
+            let firmly_occupied: std::collections::HashSet<Position> = creeps
+                .values()
+                .filter(|c| c.resolved)
+                .map(|c| c.final_pos)
+                .collect();
+
+            if let Some(avoidance) = try_local_avoidance(
+                loser_pos,
+                blocked,
+                &firmly_occupied,
+                &current_pos_to_entity,
+                idle_creep_positions,
+                is_tile_walkable,
+            ) {
+                let loser = creeps.get_mut(&loser_handle).unwrap();
+                loser.resolved = true;
+                loser.final_pos = avoidance;
+            }
         }
     }
 

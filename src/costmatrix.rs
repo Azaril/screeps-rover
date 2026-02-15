@@ -12,6 +12,12 @@ pub trait CostMatrixApply {
     where
         T: CostMatrixSet,
         TF: Fn(u8) -> u8;
+
+    /// Apply only entries where `filter` returns true for the location.
+    fn apply_to_filtered<T, F>(&self, target: &mut T, filter: F)
+    where
+        T: CostMatrixSet,
+        F: Fn(&Location) -> bool;
 }
 
 pub trait CostMatrixWrite {
@@ -63,6 +69,18 @@ impl CostMatrixApply for SparseCostMatrix {
             target.set_xy(location.to_room_xy(), new_cost);
         }
     }
+
+    fn apply_to_filtered<T, F>(&self, target: &mut T, filter: F)
+    where
+        T: CostMatrixSet,
+        F: Fn(&Location) -> bool,
+    {
+        for (location, cost) in self.data.iter() {
+            if filter(location) {
+                target.set_xy(location.to_room_xy(), *cost);
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -107,6 +125,18 @@ impl CostMatrixApply for LinearCostMatrix {
         for (location, cost) in self.data.iter() {
             let new_cost = transformer(*cost);
             target.set_xy(location.to_room_xy(), new_cost);
+        }
+    }
+
+    fn apply_to_filtered<T, F>(&self, target: &mut T, filter: F)
+    where
+        T: CostMatrixSet,
+        F: Fn(&Location) -> bool,
+    {
+        for (location, cost) in self.data.iter() {
+            if filter(location) {
+                target.set_xy(location.to_room_xy(), *cost);
+            }
         }
     }
 }

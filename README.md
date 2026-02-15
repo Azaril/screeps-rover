@@ -26,13 +26,14 @@ In Screeps, dozens of creeps navigate a shared grid world simultaneously. Naivel
 
 **Key features:**
 
-- **Three intent types** — MoveTo (pathfind to a position), Follow (chain behind a leader with optional pull), Flee (run from threats)
-- **Global conflict resolution** — priority-based tile assignment with swap detection and chain-shoving
+- **Three intent types** — MoveTo (pathfind to a position), Follow (chain behind a leader with optional pull and formation offsets), Flee (run from threats)
+- **Global conflict resolution** — priority-based tile assignment with swap detection, chain-shoving, and local avoidance
 - **Path caching** — reuse paths across ticks to save CPU; invalidate automatically on deviation
-- **Tiered stuck detection** — escalating recovery strategies from creep avoidance to shoving to failure reporting
-- **Layered cost matrices** — composable terrain, structure, creep, and construction site layers with per-room caching
+- **Tiered stuck detection** — escalating recovery strategies from proximity-limited creep avoidance to full avoidance to shoving to failure reporting
+- **Layered cost matrices** — composable terrain, structure, creep, and construction site layers with per-room caching and per-tile proximity filtering
 - **Anchor constraints** — keep stationary workers within work range even when shoved
 - **Pull mechanics** — support for the Screeps pull API to move fatigued creeps
+- **Formation support** — Follow intent supports desired offsets for maintaining formations (e.g. 2×2 quads)
 - **Offline-capable** — core algorithms work without the Screeps runtime; all game API calls are behind traits
 
 ## Features
@@ -184,7 +185,8 @@ Tick N
 │   │   • MoveTo: validate/reuse cached path or generate new one;
 │   │     extract next step as desired position
 │   │   • Follow: derive desired position from leader's resolved
-│   │     movement (step into the tile the leader vacated)
+│   │     movement (step into the tile the leader vacated, or use
+│   │     desired_offset for formation keeping)
 │   │   • Flee: run multi-target flee pathfinder
 │   │   Track stuck state, apply escalation tiers.
 │   │
@@ -192,7 +194,9 @@ Tick N
 │   │   Resolve all creeps globally:
 │   │   • Detect and execute head-to-head swaps
 │   │   • For contested tiles, highest priority wins
-│   │   • Shove displaced creeps to adjacent tiles (chain up to 3 deep)
+│   │   • Shove displaced creeps to adjacent tiles (chain up to
+│   │     max_shove_depth deep, configurable)
+│   │   • Local avoidance for blocked or losing creeps
 │   │   • Respect anchor constraints and immovable flags
 │   │
 │   └── Pass 3 ─ Execute Movement
@@ -227,6 +231,13 @@ movement_data
     .range(1)
     .pull(true);
 
+// Follow with formation offset (e.g. 2×2 quad)
+movement_data
+    .follow(entity, leader_entity)
+    .range(1)
+    .pull(true)
+    .desired_offset(1, 0);  // stay 1 tile to the right of leader
+
 // Flee from threats
 movement_data
     .flee(entity, vec![FleeTarget { pos: enemy_pos, range: 5 }]);
@@ -237,7 +248,7 @@ movement_data
 | Intent | Description | Pathfinding |
 |--------|-------------|-------------|
 | **MoveTo** | Navigate to a position within range | Cached multi-room A* via `PathfindingProvider::search()` |
-| **Follow** | Trail behind another entity | Derived from leader's resolved movement; falls back to pathfinding if leader is distant |
+| **Follow** | Trail behind another entity, optionally maintaining a formation offset | Derived from leader's resolved movement; falls back to pathfinding if leader is distant |
 | **Flee** | Move away from one or more threats | `PathfindingProvider::search_many()` with flee mode |
 
 ### Priority Levels
@@ -275,6 +286,7 @@ CreepPathData
 **Validation rules:**
 - Path is valid if destination and range match the current request
 - Creep must be at or near the start of the remaining path
+- Off-path creeps (e.g. after local avoidance) are matched to the furthest adjacent path position within a 4-tile window, skipping past tiles already bypassed
 - Path expires after `reuse_path_length` ticks (default: 5)
 - Invalidated immediately when stuck detection triggers a repath
 
@@ -309,12 +321,16 @@ The resolver (`resolver.rs`) processes all creeps in a single global pass to pro
                     │    (priority, then   │     then most stuck_ticks
                     │     stuck_ticks)     │
                     │  • Tile occupied?    │
-                    │    └─ try_shove()    │──── Recursive (max depth 3)
-                    │  • Shove succeeded?  │
+                    │    └─ try_shove()    │──── Recursive (configurable
+                    │  • Shove succeeded?  │     max depth, default 10)
                     │    ├─ Yes: winner    │
                     │    │  moves in       │
                     │    └─ No: winner     │
-                    │       stays put      │
+                    │       tries local    │──── Side-step to adjacent
+                    │       avoidance      │     tile near blocked tile
+                    │  • Losers try local  │
+                    │    avoidance too     │──── Other candidates for
+                    │                      │     the same tile side-step
                     └──────────┬───────────┘
                                │
                     ┌──────────▼───────────┐
@@ -335,23 +351,39 @@ Two creeps wanting each other's tiles (head-to-head) are detected and resolved a
 When a higher-priority creep needs a tile occupied by another creep, the resolver attempts to shove the occupant to an adjacent walkable tile:
 
 ```
-Shove chain (max depth 3):
+Shove chain (configurable max depth, default 10):
 
   [A wants tile of B]
        │
        ▼
-  Can B move to an empty adjacent tile?
+  Priority gate: A must outrank B, or A must be stuck ≥ 5 ticks
+  ├── Denied → A tries local avoidance instead
+  └── Allowed ↓
+       │
+  Can B move to its desired tile (preferred) or an empty adjacent tile?
   ├── Yes → Shove B there; A takes B's old tile
   └── No  → Can B shove its neighbor C? (depth + 1)
             ├── Yes → C moves, B takes C's tile, A takes B's tile
-            └── No  → Shove fails; A stays put
+            └── No  → Shove fails; A tries local avoidance
 ```
 
 **Shove constraints:**
 - `allow_shove` must be true on the target
 - Target must not be `Immovable` priority
+- Shover must outrank the occupant, or have been stuck ≥ 5 ticks (prevents casual displacement of stationed miners by passing haulers)
 - Anchor constraints are respected (shoved position must be within work range)
-- Maximum chain depth of 3 prevents unbounded recursion
+- Maximum chain depth is configurable via `set_max_shove_depth()` (default: 10)
+- Shoved creeps prefer their own desired position before arbitrary adjacent tiles
+
+### Local Avoidance
+
+When a creep cannot reach its desired tile (shove denied, or lost a priority contest for a contested tile), it tries **local avoidance** before giving up:
+
+1. Find an adjacent walkable tile that is also adjacent to the blocked tile (max 1-tick detour)
+2. The tile must not be occupied by any resolved or unresolved creep
+3. Among candidates, prefer tiles closest to the blocked tile
+
+This prevents creeps from standing still for a tick when a simple side-step would keep them progressing. On the next tick, the path advancement logic recognizes the creep is off-path and skips ahead to the furthest adjacent path position, avoiding backtracking to the tile that was blocked.
 
 ## Stuck Detection & Escalation
 
@@ -371,16 +403,21 @@ Stuck Escalation Tiers (default thresholds)
 Tick 0   Normal pathfinding
   │
   ▼
-Tick 2   Tier 1: Avoid friendly creeps
+Tick 2   Tier 1: Avoid nearby friendly creeps
   │       └─ Adds friendly_creeps to cost matrix (cost 255)
-  ▼         so paths route around allies
-Tick 4   Tier 2: Increase search ops
+  │         only within friendly_creep_distance tiles of the
+  ▼         creep (default 15). Ignores distant creeps that
+            will have moved by the time we arrive.
+Tick 4   Tier 1b: Avoid ALL friendly creeps
+  │       └─ Removes proximity limit — all friendly creeps in
+  ▼         every room are avoided (escalation from tier 1)
+Tick 5   Tier 2: Increase search ops
   │       └─ Doubles max_ops for pathfinder search
   ▼         to explore more of the grid
-Tick 6   Tier 3: Enable shoving
+Tick 7   Tier 3: Enable shoving
   │       └─ Resolver will shove other creeps out of
   ▼         the way during conflict resolution
-Tick 10  Tier 4: Report failure
+Tick 12  Tier 4: Report failure
   │       └─ Returns Failed(StuckTimeout) to the job
   ▼         so it can take alternative action
 Tick 15  No-progress repath
@@ -407,9 +444,9 @@ The `CostMatrixSystem` builds per-room cost matrices from composable layers with
 │  │ (base)      │  flags and costs               │
 │  └──────┬──────┘                                │
 │         │                                       │
-│  ┌──────▼──────┐  Persisted across ticks        │
+│  ┌──────▼──────┐  Rebuilt each tick             │
 │  │ Structures  │  • Roads (configurable cost)   │
-│  │ (cached)    │  • Ramparts, containers        │
+│  │ (ephemeral) │  • Ramparts, containers        │
 │  └──────┬──────┘  • Blocking structures (255)   │
 │         │                                       │
 │  ┌──────▼──────────────┐  Rebuilt each tick     │
@@ -418,9 +455,9 @@ The `CostMatrixSystem` builds per-room cost matrices from composable layers with
 │  └──────┬──────────────┘  • Friendly/hostile    │
 │         │                                       │
 │  ┌──────▼──────┐  Rebuilt each tick             │
-│  │ Creeps      │  • Friendly (255)              │
-│  │ (ephemeral) │  • Hostile (255)               │
-│  └──────┬──────┘                                │
+│  │ Creeps      │  • Friendly (255, with         │
+│  │ (ephemeral) │    proximity filtering)        │
+│  └──────┬──────┘  • Hostile (255)               │
 │         │                                       │
 │  ┌──────▼──────────────┐  Rebuilt each tick     │
 │  │ Source Keeper Aggro │  Tiles within radius 3 │
@@ -447,17 +484,35 @@ CostMatrixOptions {
     swamp_cost: 10,             // Cost for swamp terrain
     source_keeper_aggro_cost: 50, // Cost for SK aggro tiles
     // Optional per-type construction site costs...
+
+    // Proximity-limited friendly creep avoidance:
+    friendly_creep_proximity: Some(FriendlyCreepProximity {
+        origin: creep_pos,      // Measure distance from here
+        distance: 15,           // Only avoid creeps within 15 tiles
+    }),
 }
 ```
+
+### Friendly Creep Proximity Filtering
+
+When `friendly_creep_proximity` is set, friendly creep costs are only applied to tiles within the specified Chebyshev distance of the origin position. This works both across rooms and within the same room:
+
+- **Same room:** Cheap integer Chebyshev distance on raw coordinates
+- **Adjacent/nearby rooms:** Full cross-room `Position::get_range_to` per creep entry
+- **Distant rooms:** Fast-path skip — if the minimum possible tile distance between rooms exceeds the threshold, the entire room is skipped without iterating creep entries
+
+When `friendly_creep_proximity` is `None` and `friendly_creeps` is `true`, all friendly creeps in all rooms are avoided (the escalation behavior).
 
 ### Caching Strategy
 
 | Layer | Cache lifetime | Persistence |
 |-------|---------------|-------------|
-| **Structures** | Until room state changes | Serialized in `CostMatrixCache` (user-managed) |
+| **Structures** | Single tick | `#[serde(skip)]` — not persisted |
 | **Construction sites** | Single tick | `#[serde(skip)]` — not persisted |
 | **Creeps** | Single tick | `#[serde(skip)]` — not persisted |
 | **Source keeper aggro** | Single tick | `#[serde(skip)]` — not persisted |
+
+All layers are rebuilt each tick from the `CostMatrixDataSource`. The cache stores raw data (e.g. creep positions as `LinearCostMatrix`), and `build_local_cost_matrix` constructs a fresh `LocalCostMatrix` per call by composing the cached layers with the provided `CostMatrixOptions`. This means per-tile proximity filtering has no caching impact — different callers with different origins each get correctly filtered results from the same cached data.
 
 ### Persistence
 
@@ -470,13 +525,13 @@ CostMatrixOptions {
 | **traits** | `traits.rs` | Trait abstractions: `CreepHandle`, `PathfindingProvider`, `CostMatrixDataSource`, `MovementVisualizer` |
 | **screeps_impl** | `screeps_impl.rs` | *(feature `screeps`)* Real game API implementations: `ScreepsPathfinder`, `ScreepsCostMatrixDataSource`, `ScreepsMovementVisualizer`, `impl CreepHandle for Creep` |
 | **movementsystem** | `movementsystem.rs` | Core movement orchestration: path generation, stuck detection, movement execution, visualization |
-| **resolver** | `resolver.rs` | Global conflict resolution: swap detection, priority assignment, chain shoving |
-| **movementrequest** | `movementrequest.rs` | Request types: `MovementIntent`, `MovementRequest`, builder, priority, anchor constraints |
+| **resolver** | `resolver.rs` | Global conflict resolution: swap detection, priority assignment, chain shoving, local avoidance |
+| **movementrequest** | `movementrequest.rs` | Request types: `MovementIntent`, `MovementRequest`, builder, priority, anchor constraints, formation offsets |
 | **movementresult** | `movementresult.rs` | Result types: `MovementResult`, `MovementFailure`, `MovementResults` |
-| **costmatrixsystem** | `costmatrixsystem.rs` | Cost matrix management: layer caching, building; operates on user-owned `CostMatrixCache`; uses `CostMatrixDataSource` |
-| **costmatrix** | `costmatrix.rs` | Cost matrix data structures: `SparseCostMatrix`, `LinearCostMatrix`, read/write/apply traits |
-| **location** | `location.rs` | Compact `Location` type: packed `u16` coordinates, distance calculations |
-| **utility** | `utility.rs` | Room traversal rules: novice/respawn/closed zone checks, linear distance |
+| **costmatrixsystem** | `costmatrixsystem.rs` | Cost matrix management: layer caching, building, proximity filtering; operates on user-owned `CostMatrixCache`; uses `CostMatrixDataSource` |
+| **costmatrix** | `costmatrix.rs` | Cost matrix data structures: `SparseCostMatrix`, `LinearCostMatrix`, read/write/apply/filter traits |
+| **location** | `location.rs` | Re-exports `screeps_common::location` — compact `Location` type: packed `u16` coordinates, distance calculations, neighbor iteration |
+| **utility** | `utility.rs` | Room traversal rules: novice/respawn/closed zone checks, linear distance, min tile distance between rooms |
 | **error** | `error.rs` | Error type alias (`MovementError = String`) |
 | **constants** | `constants.rs` | Game constants: Source Keeper name and aggro radius |
 
@@ -574,6 +629,8 @@ fn process_movement(state: &mut MovementState) {
         Some(&mut visualizer), // or None to disable visualization
     );
     system.set_reuse_path_length(5);
+    system.set_max_shove_depth(10);
+    system.set_friendly_creep_distance(15); // tiles
 
     // Process
     let mut external = SimpleExternal {
@@ -679,8 +736,8 @@ use screeps_rover::*;
 use screeps_rover::screeps_impl::*;
 
 // The user owns the CostMatrixCache as an ECS resource.
-// Load from a RawMemory segment on environment init, or start fresh.
-let cache: CostMatrixCache = load_from_segment(55).unwrap_or_default();
+// Start fresh each environment init — all layers are ephemeral.
+let cache: CostMatrixCache = CostMatrixCache::default();
 world.insert(cache);
 ```
 
@@ -711,6 +768,8 @@ fn run(&mut self, mut data: Self::SystemData) {
         Some(&mut visualizer), // or None to disable
     );
     system.set_reuse_path_length(5);
+    system.set_max_shove_depth(10);
+    system.set_friendly_creep_distance(15);
 
     *data.movement_results = system.process(&mut external, movement_data);
 }
@@ -718,24 +777,21 @@ fn run(&mut self, mut data: Self::SystemData) {
 
 #### 4. Persist Data
 
-`CostMatrixCache` and `CreepMovementData` are both serializable. Persist them across ticks so paths and structure cost data survive VM reloads:
+`CreepMovementData` is serializable. Persist it across ticks so paths survive VM reloads:
 
 ```rust
-// Serialize the cost matrix cache to a RawMemory segment after the tick:
-save_to_segment(55, &cost_matrix_cache);
-
 // CreepMovementData is stored per-entity in your ECS and serialized
 // alongside other components.
 ```
 
-Ephemeral cost matrix layers (creeps, construction sites) are `#[serde(skip)]` and will be rebuilt automatically from the `CostMatrixDataSource` on the next tick.
+Ephemeral cost matrix layers (structures, creeps, construction sites) are `#[serde(skip)]` and will be rebuilt automatically from the `CostMatrixDataSource` on the next tick.
 
 ## Dependencies
 
 | Crate | Purpose |
 |-------|---------|
 | [screeps-game-api](https://github.com/rustyscreeps/screeps-game-api) | Pure-Rust data types (`Position`, `RoomName`, `Direction`, etc.). JS interop types are only used behind the `screeps` feature. |
-| [screeps-cache](https://github.com/Azaril/screeps-cache) | Lazy evaluation and caching utilities |
+| [screeps-common](https://github.com/Azaril/screeps-common) | Shared data types (`Location`) used across screeps crates |
 | [serde](https://serde.rs/) | Serialization for path data, cost matrices, and stuck state |
 | [log](https://docs.rs/log/) | Logging facade |
 | screeps-timing *(optional, `profile` feature)* | Profiling and timing instrumentation |

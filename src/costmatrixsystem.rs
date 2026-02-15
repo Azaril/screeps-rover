@@ -74,6 +74,19 @@ impl CostMatrixCache {
     }
 }
 
+/// Constrains friendly creep avoidance to a radius around an origin position.
+/// Creeps beyond `distance` tiles (Chebyshev) of `origin` are ignored in the
+/// cost matrix. Works both across rooms and within the same room.
+#[derive(Copy, Clone, Debug)]
+pub struct FriendlyCreepProximity {
+    /// The position to measure distance from (typically the pathing creep's
+    /// current position).
+    pub origin: Position,
+    /// Maximum tile distance (Chebyshev) within which friendly creeps are
+    /// considered. Creeps beyond this distance are ignored.
+    pub distance: u32,
+}
+
 #[derive(Copy, Clone)]
 pub struct CostMatrixOptions {
     pub structures: bool,
@@ -89,6 +102,16 @@ pub struct CostMatrixOptions {
     pub friendly_active_construction_site_cost: Option<u8>,
     pub hostile_inactive_construction_site_cost: Option<u8>,
     pub hostile_active_construction_site_cost: Option<u8>,
+    /// When set, friendly creeps are only applied to the cost matrix for tiles
+    /// within `distance` of `origin`. Creeps further away are likely to have
+    /// moved by the time the pathing creep arrives, so avoiding them produces
+    /// sub-optimal detours. This works both across rooms and within the same
+    /// room.
+    ///
+    /// When `None` and `friendly_creeps` is `true`, friendly creeps are applied
+    /// to all tiles (the original behaviour, used as an escalation when the
+    /// proximity-limited version fails to resolve stuck state).
+    pub friendly_creep_proximity: Option<FriendlyCreepProximity>,
 }
 
 impl Default for CostMatrixOptions {
@@ -107,6 +130,7 @@ impl Default for CostMatrixOptions {
             friendly_active_construction_site_cost: Some(3),
             hostile_inactive_construction_site_cost: Some(2),
             hostile_active_construction_site_cost: Some(1),
+            friendly_creep_proximity: None,
         }
     }
 }
@@ -241,7 +265,51 @@ impl CostMatrixCache {
                 }
 
                 if options.friendly_creeps {
-                    creeps.data.friendly_creeps.apply_to(&mut lcm);
+                    if let Some(ref proximity) = options.friendly_creep_proximity {
+                        // Fast path: if the entire room is beyond the
+                        // proximity distance, skip it without iterating
+                        // individual creep entries.
+                        let room_min_dist = super::utility::min_tile_distance_between_rooms(
+                            proximity.origin.room_name(),
+                            room_name,
+                        );
+                        if room_min_dist <= proximity.distance {
+                            // Per-tile filter: only apply creeps within range.
+                            let origin_x = proximity.origin.x().u8() as i32;
+                            let origin_y = proximity.origin.y().u8() as i32;
+                            let origin_room = proximity.origin.room_name();
+                            let max_dist = proximity.distance;
+
+                            if origin_room == room_name {
+                                // Same room: cheap Chebyshev on raw coords.
+                                creeps.data.friendly_creeps.apply_to_filtered(
+                                    &mut lcm,
+                                    |loc| {
+                                        let dx = (loc.x() as i32 - origin_x).unsigned_abs();
+                                        let dy = (loc.y() as i32 - origin_y).unsigned_abs();
+                                        dx.max(dy) <= max_dist
+                                    },
+                                );
+                            } else {
+                                // Different room: use Position::get_range_to
+                                // for correct cross-room distance.
+                                creeps.data.friendly_creeps.apply_to_filtered(
+                                    &mut lcm,
+                                    |loc| {
+                                        let pos = Position::new(
+                                            RoomCoordinate::new(loc.x()).unwrap(),
+                                            RoomCoordinate::new(loc.y()).unwrap(),
+                                            room_name,
+                                        );
+                                        pos.get_range_to(proximity.origin) <= max_dist
+                                    },
+                                );
+                            }
+                        }
+                        // else: entire room is out of range, skip all creeps.
+                    } else {
+                        creeps.data.friendly_creeps.apply_to(&mut lcm);
+                    }
                 }
 
                 if options.hostile_creeps {

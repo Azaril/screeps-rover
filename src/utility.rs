@@ -28,6 +28,26 @@ pub fn room_linear_distance(from: RoomName, to: RoomName) -> u32 {
     dx.max(dy)
 }
 
+/// Compute the minimum possible tile distance (Chebyshev) between any tile
+/// in room `a` and any tile in room `b`.
+///
+/// Same room → 0. Adjacent rooms → 1 (tiles on shared border are range 1).
+/// Rooms N apart → roughly `(N - 1) * 50 + 1` (closest border tiles).
+///
+/// This is a conservative lower bound used as a fast-path check: if the
+/// minimum exceeds a threshold, no tile in the room can be within range.
+pub fn min_tile_distance_between_rooms(a: RoomName, b: RoomName) -> u32 {
+    if a == b {
+        return 0;
+    }
+    let dx = (a.x_coord() - b.x_coord()).unsigned_abs();
+    let dy = (a.y_coord() - b.y_coord()).unsigned_abs();
+    // Adjacent rooms (dx=1 or dy=1) have border tiles at range 1.
+    // Rooms further apart: each additional room gap adds ~50 tiles.
+    let room_gap = dx.max(dy);
+    (room_gap - 1) * 50 + 1
+}
+
 /// Check if two rooms can be traversed between using the live game API.
 #[cfg(feature = "screeps")]
 pub fn can_traverse_between_rooms(from: RoomName, to: RoomName) -> bool {

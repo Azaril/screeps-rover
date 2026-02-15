@@ -15,8 +15,12 @@ use std::hash::Hash;
 /// might have lower thresholds for faster reaction).
 #[derive(Clone, Debug)]
 pub struct StuckThresholds {
-    /// Ticks immobile before avoiding friendly creeps in pathfinding (tier 1).
+    /// Ticks immobile before avoiding *nearby* friendly creeps in pathfinding (tier 1).
+    /// Only creeps within `friendly_creep_distance` rooms are avoided.
     pub avoid_friendly_creeps: u16,
+    /// Ticks immobile before avoiding *all* friendly creeps regardless of
+    /// distance (tier 1b). Escalation from the proximity-limited tier.
+    pub avoid_all_friendly_creeps: u16,
     /// Ticks immobile before increasing search max_ops (tier 2).
     pub increase_ops: u16,
     /// Ticks immobile before enabling shoving in the resolver (tier 3).
@@ -31,9 +35,10 @@ impl Default for StuckThresholds {
     fn default() -> Self {
         StuckThresholds {
             avoid_friendly_creeps: 2,
-            increase_ops: 4,
-            enable_shoving: 6,
-            report_failure: 10,
+            avoid_all_friendly_creeps: 4,
+            increase_ops: 5,
+            enable_shoving: 7,
+            report_failure: 12,
             no_progress_repath: 15,
         }
     }
@@ -87,6 +92,10 @@ impl StuckState {
         self.should_avoid_friendly_creeps_with(&StuckThresholds::default())
     }
 
+    pub fn should_avoid_all_friendly_creeps(&self) -> bool {
+        self.should_avoid_all_friendly_creeps_with(&StuckThresholds::default())
+    }
+
     pub fn should_increase_ops(&self) -> bool {
         self.should_increase_ops_with(&StuckThresholds::default())
     }
@@ -97,6 +106,10 @@ impl StuckState {
 
     pub fn should_avoid_friendly_creeps_with(&self, thresholds: &StuckThresholds) -> bool {
         self.ticks_immobile >= thresholds.avoid_friendly_creeps
+    }
+
+    pub fn should_avoid_all_friendly_creeps_with(&self, thresholds: &StuckThresholds) -> bool {
+        self.ticks_immobile >= thresholds.avoid_all_friendly_creeps
     }
 
     pub fn should_increase_ops_with(&self, thresholds: &StuckThresholds) -> bool {
@@ -221,12 +234,25 @@ pub trait MovementSystemExternal<Handle> {
     fn get_entity_position(&self, entity: Handle) -> Option<Position>;
 }
 
+/// Default tile distance (Chebyshev) for proximity-limited friendly creep
+/// avoidance. Creeps beyond this many tiles from the pathing origin are
+/// ignored in the cost matrix, since they will likely have moved by the time
+/// we arrive.
+pub const DEFAULT_FRIENDLY_CREEP_DISTANCE: u32 = 5;
+
 pub struct MovementSystem<'a, Handle> {
     cost_matrix_system: &'a mut CostMatrixSystem<'a>,
     pathfinder: &'a mut dyn PathfindingProvider,
     visualizer: Option<&'a mut dyn MovementVisualizer>,
     reuse_path_length: u32,
     max_shove_depth: u32,
+    /// Maximum tile distance (Chebyshev) from the creep's position for the
+    /// first tier of friendly creep avoidance. Creeps beyond this distance
+    /// will not have their positions marked as impassable, since they will
+    /// likely have moved by the time the pathing creep arrives. Set to 0 to
+    /// disable proximity limiting (equivalent to the old behaviour of avoiding
+    /// all creeps).
+    friendly_creep_distance: u32,
     phantom: std::marker::PhantomData<Handle>,
 }
 
@@ -246,6 +272,7 @@ where
             visualizer,
             reuse_path_length: 5,
             max_shove_depth: DEFAULT_MAX_SHOVE_DEPTH,
+            friendly_creep_distance: DEFAULT_FRIENDLY_CREEP_DISTANCE,
             phantom: std::marker::PhantomData,
         }
     }
@@ -256,6 +283,13 @@ where
 
     pub fn set_max_shove_depth(&mut self, depth: u32) {
         self.max_shove_depth = depth;
+    }
+
+    /// Set the maximum tile distance (Chebyshev) for proximity-limited
+    /// friendly creep avoidance. Set to 0 to disable proximity limiting (all
+    /// creeps get avoided when the tier is active).
+    pub fn set_friendly_creep_distance(&mut self, distance: u32) {
+        self.friendly_creep_distance = distance;
     }
 
     /// Global movement resolution with conflict detection, shove/swap, and follow support.
@@ -559,13 +593,18 @@ where
                     let on_path = path_data.path.iter().take(2).any(|p| *p == creep_pos);
 
                     if !on_path {
-                        let nearby_index = path_data
-                            .path
-                            .iter()
-                            .take(4)
-                            .position(|p| creep_pos.get_range_to(*p) <= 1);
+                        // Find the furthest path position (within a small
+                        // window) adjacent to the creep. Using the furthest
+                        // match lets us skip past tiles the creep already
+                        // bypassed via local avoidance, preventing backtracking.
+                        let mut best_nearby: Option<usize> = None;
+                        for (i, p) in path_data.path.iter().take(4).enumerate() {
+                            if creep_pos.get_range_to(*p) <= 1 {
+                                best_nearby = Some(i);
+                            }
+                        }
 
-                        if let Some(idx) = nearby_index {
+                        if let Some(idx) = best_nearby {
                             path_data.path.drain(..idx);
                         } else {
                             creep_data.path_data = None;
@@ -597,12 +636,19 @@ where
                 let (effective_index, was_shoved_off) = match current_index {
                     Some(idx) => (Some(idx), false),
                     None => {
-                        let adjacent_to_start = path
-                            .first()
-                            .map(|p| creep_pos.get_range_to(*p) <= 1)
-                            .unwrap_or(false);
-                        if adjacent_to_start {
-                            (Some(0), true)
+                        // Creep is not exactly on the path. This happens after
+                        // local avoidance (side-step) or a shove. Find the
+                        // furthest path position (within a small window) that
+                        // the creep is adjacent to, so we skip past the tile
+                        // that was blocked and avoid backtracking.
+                        let mut best_adjacent: Option<usize> = None;
+                        for (i, p) in path.iter().take(4).enumerate() {
+                            if creep_pos.get_range_to(*p) <= 1 {
+                                best_adjacent = Some(i);
+                            }
+                        }
+                        if let Some(idx) = best_adjacent {
+                            (Some(idx), true)
                         } else {
                             (None, false)
                         }
@@ -615,16 +661,35 @@ where
                         path.drain(..idx);
 
                         if path.len() <= 1 {
-                            return Ok(None);
-                        }
-
-                        if was_shoved_off || !moved {
-                            path_data.stuck_state.record_immobile(current_distance);
+                            // Path exhausted. If the creep is within range of
+                            // the destination, it genuinely arrived. Otherwise
+                            // the path was over-consumed (e.g. aggressive
+                            // skip-ahead after local avoidance) and we need a
+                            // fresh path from the current position.
+                            if current_distance <= path_data.range {
+                                return Ok(None);
+                            }
+                            // Clear path so a new one is generated below.
+                            creep_data.path_data = None;
+                            (None, None)
                         } else {
-                            path_data.stuck_state.record_moved(current_distance);
-                        }
+                            if moved {
+                                // The creep advanced along the path — either it
+                                // walked normally or it side-stepped via local
+                                // avoidance and ended up adjacent to a further
+                                // path position. Either way, it made progress.
+                                path_data.stuck_state.record_moved(current_distance);
+                            } else if was_shoved_off {
+                                // Off-path but didn't advance (adjacent only to
+                                // path start). Likely shoved sideways.
+                                path_data.stuck_state.record_immobile(current_distance);
+                            } else {
+                                // On-path but at the same position as last tick.
+                                path_data.stuck_state.record_immobile(current_distance);
+                            }
 
-                        (Some(path_data.time), Some(path_data.stuck_state.clone()))
+                            (Some(path_data.time), Some(path_data.stuck_state.clone()))
+                        }
                     }
                     None => {
                         creep_data.path_data = None;
@@ -887,8 +952,22 @@ where
 
         let mut cost_matrix_options = request.cost_matrix_options.unwrap_or_default();
 
-        if stuck_state.should_avoid_friendly_creeps() {
+        if stuck_state.should_avoid_all_friendly_creeps() {
+            // Tier 1b: avoid ALL friendly creeps in every room (escalation).
             cost_matrix_options.friendly_creeps = true;
+            cost_matrix_options.friendly_creep_proximity = None;
+        } else if stuck_state.should_avoid_friendly_creeps() {
+            // Tier 1: avoid friendly creeps only within a tile radius of the
+            // creep. Creeps further away will have moved by the time we
+            // arrive, so including them produces sub-optimal detours.
+            cost_matrix_options.friendly_creeps = true;
+            if self.friendly_creep_distance > 0 {
+                cost_matrix_options.friendly_creep_proximity =
+                    Some(FriendlyCreepProximity {
+                        origin: creep_pos,
+                        distance: self.friendly_creep_distance,
+                    });
+            }
         }
 
         let ops_multiplier = if stuck_state.should_increase_ops() {
