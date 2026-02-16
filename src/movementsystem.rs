@@ -718,29 +718,52 @@ where
         };
 
         if needs_path || path_expired || stuck_needs_repath {
-            let path_points = self.generate_path(
+            match self.generate_path(
                 external,
                 destination,
                 range,
                 request,
                 creep_pos,
                 &stuck_state_for_gen,
-            )?;
+            ) {
+                Ok(path_points) => {
+                    let creep_data = external
+                        .get_creep_movement_data(entity)
+                        .map_err(MovementFailure::InternalError)?;
 
-            let creep_data = external
-                .get_creep_movement_data(entity)
-                .map_err(MovementFailure::InternalError)?;
+                    let mut new_stuck_state = stuck_state_for_gen.clone();
+                    new_stuck_state.repath_count = new_stuck_state.repath_count.saturating_add(1);
 
-            let mut new_stuck_state = stuck_state_for_gen.clone();
-            new_stuck_state.repath_count = new_stuck_state.repath_count.saturating_add(1);
-
-            creep_data.path_data = Some(CreepPathData {
-                destination,
-                range,
-                path: path_points,
-                time: 0,
-                stuck_state: new_stuck_state,
-            });
+                    creep_data.path_data = Some(CreepPathData {
+                        destination,
+                        range,
+                        path: path_points,
+                        time: 0,
+                        stuck_state: new_stuck_state,
+                    });
+                }
+                Err(failure) => {
+                    if needs_path {
+                        // No existing path to fall back to — propagate the error.
+                        return Err(failure);
+                    }
+                    // A stuck-triggered or expiry repath failed (e.g. friendly
+                    // creeps made the only corridor impassable). Keep the existing
+                    // path so the resolver's shove/swap/local-avoidance mechanisms
+                    // can clear the blockage as the stuck timer escalates. Without
+                    // this fallback the creep would immediately report PathNotFound
+                    // to the job layer, short-circuiting the tiered recovery.
+                    //
+                    // Reset the path timer so we don't immediately re-attempt a
+                    // doomed repath on the very next tick. The stuck timer still
+                    // advances, so escalation (shove/swap) continues normally.
+                    if let Ok(creep_data) = external.get_creep_movement_data(entity) {
+                        if let Some(path_data) = creep_data.path_data.as_mut() {
+                            path_data.time = 0;
+                        }
+                    }
+                }
+            }
         }
 
         // Extract next step.
