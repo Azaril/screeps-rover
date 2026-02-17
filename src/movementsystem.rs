@@ -240,6 +240,21 @@ pub trait MovementSystemExternal<Handle> {
 /// we arrive.
 pub const DEFAULT_FRIENDLY_CREEP_DISTANCE: u32 = 5;
 
+/// Tracks CPU spent on non-stuck path expiry repathing within a single tick.
+pub struct RepathBudget<'a> {
+    get_cpu: Box<dyn Fn() -> f64 + 'a>,
+    budget: f64,
+    start_cpu: f64,
+}
+
+impl<'a> RepathBudget<'a> {
+    /// Returns `true` when the repath budget has been exhausted.
+    fn is_exhausted(&self) -> bool {
+        let spent = (self.get_cpu)() - self.start_cpu;
+        spent >= self.budget
+    }
+}
+
 pub struct MovementSystem<'a, Handle> {
     cost_matrix_system: &'a mut CostMatrixSystem<'a>,
     pathfinder: &'a mut dyn PathfindingProvider,
@@ -253,6 +268,15 @@ pub struct MovementSystem<'a, Handle> {
     /// disable proximity limiting (equivalent to the old behaviour of avoiding
     /// all creeps).
     friendly_creep_distance: u32,
+    /// CPU budget for stuck repathing. When exhausted, the movement system
+    /// skips pathfinding for stuck creeps (they keep their existing path and
+    /// the resolver's shove/swap mechanisms can still help). Only
+    /// `needs_path` (creeps with no path at all) is unconditional.
+    cpu_budget: Option<RepathBudget<'a>>,
+    /// CPU budget for non-stuck path expiry repathing. Paths older than
+    /// `reuse_path_length` are eligible for re-evaluation but only if this
+    /// budget has not been exhausted.
+    repath_budget: Option<RepathBudget<'a>>,
     phantom: std::marker::PhantomData<Handle>,
 }
 
@@ -273,6 +297,8 @@ where
             reuse_path_length: 5,
             max_shove_depth: DEFAULT_MAX_SHOVE_DEPTH,
             friendly_creep_distance: DEFAULT_FRIENDLY_CREEP_DISTANCE,
+            cpu_budget: None,
+            repath_budget: None,
             phantom: std::marker::PhantomData,
         }
     }
@@ -290,6 +316,44 @@ where
     /// creeps get avoided when the tier is active).
     pub fn set_friendly_creep_distance(&mut self, distance: u32) {
         self.friendly_creep_distance = distance;
+    }
+
+    /// Set a CPU budget for the movement system. `get_cpu` returns the
+    /// current CPU usage; `budget` is the maximum CPU that may be spent on
+    /// pathfinding for stuck creeps this tick. The start CPU is captured
+    /// immediately when this method is called. Only `needs_path` (creeps
+    /// with no path at all) is unconditional; stuck repathing is skipped
+    /// once this budget is exhausted.
+    pub fn set_cpu_budget(&mut self, get_cpu: impl Fn() -> f64 + 'a, budget: f64) {
+        let start_cpu = get_cpu();
+        self.cpu_budget = Some(RepathBudget {
+            get_cpu: Box::new(get_cpu),
+            budget,
+            start_cpu,
+        });
+    }
+
+    /// Set a CPU budget for non-stuck path expiry repathing. `get_cpu`
+    /// returns the current CPU usage; `budget` is the maximum CPU that may
+    /// be spent on expiry repathing this tick. The start CPU is captured
+    /// immediately when this method is called.
+    pub fn set_repath_budget(&mut self, get_cpu: impl Fn() -> f64 + 'a, budget: f64) {
+        let start_cpu = get_cpu();
+        self.repath_budget = Some(RepathBudget {
+            get_cpu: Box::new(get_cpu),
+            budget,
+            start_cpu,
+        });
+    }
+
+    /// Returns `true` when the movement CPU budget has been exhausted.
+    fn is_cpu_budget_exhausted(&self) -> bool {
+        self.cpu_budget.as_ref().is_none_or(|b| b.is_exhausted())
+    }
+
+    /// Returns `true` when the repath budget for expiry repathing is exhausted.
+    fn is_repath_budget_exhausted(&self) -> bool {
+        self.repath_budget.as_ref().is_none_or(|b| b.is_exhausted())
     }
 
     /// Global movement resolution with conflict detection, shove/swap, and follow support.
@@ -717,7 +781,49 @@ where
             creep_data.path_data.is_none()
         };
 
-        if needs_path || path_expired || stuck_needs_repath {
+        // Determine whether to pathfind, respecting CPU budgets.
+        //
+        // Priority:
+        //   1. needs_path (no path at all) -- always pathfind, unconditional.
+        //   2. stuck_needs_repath -- pathfind unless hard limit is hit.
+        //   3. path_expired -- pathfind only if repath budget remains AND
+        //      hard limit not hit. This is the lowest priority.
+        //
+        // When pathfinding is skipped for budget reasons, the path timer
+        // resets so the creep continues on its existing path without
+        // re-triggering on the very next tick.
+        let should_pathfind = if needs_path {
+            true
+        } else if stuck_needs_repath {
+            if self.is_cpu_budget_exhausted() {
+                // CPU budget exhausted: skip stuck repath, keep existing path.
+                if let Ok(creep_data) = external.get_creep_movement_data(entity) {
+                    if let Some(path_data) = creep_data.path_data.as_mut() {
+                        path_data.time = 0;
+                    }
+                }
+                false
+            } else {
+                true
+            }
+        } else if path_expired {
+            if self.is_cpu_budget_exhausted() || self.is_repath_budget_exhausted() {
+                // CPU budget or repath budget exhausted: skip expiry repath,
+                // reset timer and keep existing path.
+                if let Ok(creep_data) = external.get_creep_movement_data(entity) {
+                    if let Some(path_data) = creep_data.path_data.as_mut() {
+                        path_data.time = 0;
+                    }
+                }
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+
+        if should_pathfind {
             match self.generate_path(
                 external,
                 destination,
@@ -744,7 +850,7 @@ where
                 }
                 Err(failure) => {
                     if needs_path {
-                        // No existing path to fall back to — propagate the error.
+                        // No existing path to fall back to -- propagate the error.
                         return Err(failure);
                     }
                     // A stuck-triggered or expiry repath failed (e.g. friendly
