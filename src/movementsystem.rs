@@ -10,6 +10,16 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::hash::Hash;
 
+/// Maximum number of rooms to consider for a single pathfinding search. Limits CPU
+/// when pathing to far or impossible destinations (find_route can return long routes).
+const MAX_PATHFIND_ROOMS: usize = 16;
+
+/// Ceiling on pathfinder max_ops per search. 1 op ≈ 0.001 CPU, so 20_000 ops ≈ 20 CPU.
+const MAX_PATHFIND_OPS: u32 = 20_000;
+
+/// Default per-tick pathfinding ops budget (20 CPU). Enforced so movement cannot exhaust the tick.
+const DEFAULT_PATHFIND_OPS_BUDGET: u32 = 20_000;
+
 /// Configurable thresholds for stuck detection tiers.
 /// Different job types can use different thresholds (e.g. military creeps
 /// might have lower thresholds for faster reaction).
@@ -207,6 +217,11 @@ where
             .or_insert_with(|| MovementRequest::flee(targets))
             .into()
     }
+
+    /// Number of movement requests this tick (for CPU budgeting; each move action costs 0.2 CPU).
+    pub fn request_count(&self) -> usize {
+        self.requests.len()
+    }
 }
 
 /// External interface that the movement system uses to interact with the
@@ -255,6 +270,9 @@ impl<'a> RepathBudget<'a> {
     }
 }
 
+/// (get_cpu, start_cpu, max_cpu) for hard movement CPU cap per tick.
+type MovementCpuCap<'a> = (Box<dyn Fn() -> f64 + 'a>, f64, f64);
+
 pub struct MovementSystem<'a, Handle> {
     cost_matrix_system: &'a mut CostMatrixSystem<'a>,
     pathfinder: &'a mut dyn PathfindingProvider,
@@ -277,6 +295,17 @@ pub struct MovementSystem<'a, Handle> {
     /// `reuse_path_length` are eligible for re-evaluation but only if this
     /// budget has not been exhausted.
     repath_budget: Option<RepathBudget<'a>>,
+    /// Per-tick pathfinding ops cap (1 op ≈ 0.001 CPU). Reset to this at start of process().
+    pathfinding_ops_budget_cap: u32,
+    /// Remaining pathfinding ops this tick. All pathfinding (including needs_path) deducts from this.
+    pathfinding_ops_budget_remaining: u32,
+    /// When set, process() skips all work for a creep once get_cpu() >= limit (avoids exceeding tick limit).
+    tick_limit: Option<(Box<dyn Fn() -> f64 + 'a>, f64)>,
+    /// When set, process() also skips work once (get_cpu() - start_cpu) >= max_cpu (hard movement CPU cap per tick).
+    movement_cpu_cap: Option<MovementCpuCap<'a>>,
+    /// When set, do not start pathfinding unless (used + headroom) <= max_cpu. Prevents one unbounded find_route
+    /// from blowing the cap when we were just under it (e.g. at 79 CPU with cap 80, one pathfind can use 100+).
+    pathfinding_headroom: Option<f64>,
     phantom: std::marker::PhantomData<Handle>,
 }
 
@@ -299,8 +328,37 @@ where
             friendly_creep_distance: DEFAULT_FRIENDLY_CREEP_DISTANCE,
             cpu_budget: None,
             repath_budget: None,
+            pathfinding_ops_budget_cap: DEFAULT_PATHFIND_OPS_BUDGET,
+            pathfinding_ops_budget_remaining: DEFAULT_PATHFIND_OPS_BUDGET,
+            tick_limit: None,
+            movement_cpu_cap: None,
+            pathfinding_headroom: None,
             phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Set pathfinding headroom: do not start pathfinding when (get_cpu() - start_cpu) + headroom > max_cpu.
+    /// Use e.g. Some(movement_cap) to disable pathfinding when cap is tight; use None for previous behavior.
+    pub fn set_pathfinding_headroom(&mut self, headroom: Option<f64>) {
+        self.pathfinding_headroom = headroom;
+    }
+
+    /// Set a tick CPU limit. When set, process() skips all work for each creep once
+    /// get_cpu() >= limit, inserting MovementResult::Moving so the tick does not exceed the limit.
+    pub fn set_tick_limit(&mut self, get_cpu: impl Fn() -> f64 + 'a, limit: f64) {
+        self.tick_limit = Some((Box::new(get_cpu), limit));
+    }
+
+    /// Set the per-tick pathfinding ops budget (1 op ≈ 0.001 CPU). E.g. 20_000 = 20 CPU max
+    /// for all pathfinding this tick. Applies to every pathfinding call including first-time paths.
+    pub fn set_pathfinding_ops_budget(&mut self, ops: u32) {
+        self.pathfinding_ops_budget_cap = ops;
+    }
+
+    /// Set a hard cap on CPU the movement system may use this tick. Once (get_cpu() - start_cpu) >= max_cpu,
+    /// process() skips further work (same as tick limit). start_cpu should be captured at movement run start.
+    pub fn set_movement_cpu_cap(&mut self, get_cpu: impl Fn() -> f64 + 'a, start_cpu: f64, max_cpu: f64) {
+        self.movement_cpu_cap = Some((Box::new(get_cpu), start_cpu, max_cpu));
     }
 
     pub fn set_reuse_path_length(&mut self, length: u32) {
@@ -356,6 +414,20 @@ where
         self.repath_budget.as_ref().is_none_or(|b| b.is_exhausted())
     }
 
+    /// True when we have hit the tick CPU limit and should skip work for this creep.
+    fn is_over_tick_limit(&self) -> bool {
+        self.tick_limit
+            .as_ref()
+            .is_some_and(|(get_cpu, limit)| (get_cpu)() >= *limit)
+    }
+
+    /// True when the movement CPU cap is set and (get_cpu() - start_cpu) >= max_cpu.
+    fn is_over_movement_cap(&self) -> bool {
+        self.movement_cpu_cap.as_ref().is_some_and(|(get_cpu, start, max)| {
+            (get_cpu)() - start >= *max
+        })
+    }
+
     /// Global movement resolution with conflict detection, shove/swap, and follow support.
     pub fn process<S>(
         &mut self,
@@ -371,6 +443,9 @@ where
             return results;
         }
 
+        // Reset per-tick pathfinding ops budget so we don't exhaust CPU (1 op ≈ 0.001 CPU).
+        self.pathfinding_ops_budget_remaining = self.pathfinding_ops_budget_cap;
+
         // --- Pass 0: Dependency analysis for Follow intents ---
         let (sorted_entities, broken_follows) = topological_sort_follows(&data.requests);
 
@@ -378,8 +453,14 @@ where
         let mut leader_moves: HashMap<Handle, (Position, Option<Position>)> = HashMap::new();
         let mut resolved_creeps: HashMap<Handle, ResolvedCreep<Handle>> = HashMap::new();
         let mut pull_pairs: HashMap<Handle, Handle> = HashMap::new();
+        let mut work_done_this_tick = false;
 
         for entity in &sorted_entities {
+            if (self.is_over_tick_limit() || self.is_over_movement_cap()) && work_done_this_tick {
+                results.insert(*entity, MovementResult::Moving);
+                continue;
+            }
+
             let request = match data.requests.get(entity) {
                 Some(r) => r,
                 None => continue,
@@ -516,23 +597,31 @@ where
                     results.insert(*entity, MovementResult::Failed(err));
                 }
             }
+            work_done_this_tick = true;
         }
 
         // --- Pass 2: Conflict resolution ---
         let idle_creep_positions: HashMap<Position, Handle> = HashMap::new();
 
-        let pathfinder = &mut *self.pathfinder;
-        let is_tile_walkable = |pos: Position| -> bool { pathfinder.is_tile_walkable(pos) };
+        if !self.is_over_tick_limit() && !self.is_over_movement_cap() {
+            let pathfinder = &mut *self.pathfinder;
+            let is_tile_walkable = |pos: Position| -> bool { pathfinder.is_tile_walkable(pos) };
 
-        resolve_conflicts(
-            &mut resolved_creeps,
-            &idle_creep_positions,
-            &is_tile_walkable,
-            self.max_shove_depth,
-        );
+            resolve_conflicts(
+                &mut resolved_creeps,
+                &idle_creep_positions,
+                &is_tile_walkable,
+                self.max_shove_depth,
+            );
+        }
 
         // --- Pass 3: Execute movement and record results ---
+        let mut executed_one_move = false;
         for (entity, resolved) in &resolved_creeps {
+            if (self.is_over_tick_limit() || self.is_over_movement_cap()) && executed_one_move {
+                results.insert(*entity, MovementResult::Moving);
+                continue;
+            }
             if results.results.contains_key(entity) {
                 continue;
             }
@@ -589,6 +678,7 @@ where
                     let _ = leader_creep.pull(&creep);
                     let _ = creep.move_pulled_by(&leader_creep);
                     results.insert(*entity, MovementResult::Moving);
+                    executed_one_move = true;
                     continue;
                 }
             }
@@ -599,6 +689,7 @@ where
                 Some(dir) => match creep.move_direction(dir) {
                     Ok(()) => {
                         results.insert(*entity, MovementResult::Moving);
+                        executed_one_move = true;
                     }
                     Err(e) => {
                         results.insert(
@@ -617,8 +708,11 @@ where
         }
 
         // --- Visualization ---
-        if self.visualizer.is_some() {
+        if self.visualizer.is_some() && !self.is_over_tick_limit() && !self.is_over_movement_cap() {
             for entity in sorted_entities.iter() {
+                if self.is_over_tick_limit() || self.is_over_movement_cap() {
+                    break;
+                }
                 if let Some(request) = data.requests.get(entity) {
                     let result = results.get(entity);
                     self.visualize_entity(external, *entity, request, result);
@@ -1007,7 +1101,22 @@ where
             return Ok(None);
         }
 
+        if self.is_over_tick_limit() {
+            return Err(MovementFailure::PathNotFound);
+        }
+
         let goals: Vec<(Position, u32)> = targets.iter().map(|t| (t.pos, t.range)).collect();
+
+        let flee_ops = 2000u32;
+        let mut allowed_ops = flee_ops.min(self.pathfinding_ops_budget_remaining);
+        if let Some((get_cpu, limit)) = &self.tick_limit {
+            let cpu_left = ((*limit - (get_cpu)()).max(0.0) * 1000.0) as u32;
+            allowed_ops = allowed_ops.min(cpu_left);
+        }
+        if allowed_ops == 0 {
+            return Err(MovementFailure::PathNotFound);
+        }
+        self.pathfinding_ops_budget_remaining -= allowed_ops;
 
         let cost_matrix_options = request.cost_matrix_options.unwrap_or_default();
         let cost_matrix_system = &mut self.cost_matrix_system;
@@ -1026,7 +1135,7 @@ where
                     .build_local_cost_matrix(room_name, &cost_matrix_options)
                     .ok()
             },
-            2000,
+            allowed_ops,
             cost_matrix_options.plains_cost,
             cost_matrix_options.swamp_cost,
         );
@@ -1050,6 +1159,23 @@ where
     where
         S: MovementSystemExternal<Handle>,
     {
+        if self.is_over_tick_limit() {
+            return Err(MovementFailure::PathNotFound);
+        }
+        if self.is_over_movement_cap() {
+            return Err(MovementFailure::PathNotFound);
+        }
+        // Do not start pathfinding unless we have at least headroom CPU left under the cap (find_route is unbounded).
+        if let (Some((get_cpu, start, max)), Some(headroom)) = (
+            self.movement_cpu_cap.as_ref(),
+            self.pathfinding_headroom,
+        ) {
+            let used = (get_cpu)() - start;
+            if used + headroom > *max {
+                return Err(MovementFailure::PathNotFound);
+            }
+        }
+
         let creep_room_name = creep_pos.room_name();
         let room_options = request.room_options.unwrap_or_default();
         let destination_room = destination.room_name();
@@ -1072,8 +1198,11 @@ where
                 ))
             })?;
 
+        // Cap rooms so we don't build cost matrices for 50+ rooms or give pathfinder
+        // huge max_ops when the destination is far/impossible.
         let room_names: HashSet<_> = room_path
             .iter()
+            .take(MAX_PATHFIND_ROOMS.saturating_sub(2)) // leave room for origin + dest
             .map(|step| step.room)
             .chain(std::iter::once(creep_room_name))
             .chain(std::iter::once(destination_room))
@@ -1104,8 +1233,24 @@ where
         } else {
             1
         };
-        let max_ops = room_names.len() as u32 * 2000 * ops_multiplier;
+        let max_ops = (room_names.len() as u32 * 2000 * ops_multiplier).min(MAX_PATHFIND_OPS);
 
+        // Deduct from per-tick pathfinding ops budget (1 op ≈ 0.001 CPU).
+        let mut allowed_ops = max_ops.min(self.pathfinding_ops_budget_remaining);
+        if let Some((get_cpu, limit)) = &self.tick_limit {
+            let cpu_left = ((*limit - (get_cpu)()).max(0.0) * 1000.0) as u32;
+            allowed_ops = allowed_ops.min(cpu_left);
+        }
+        if allowed_ops == 0 {
+            return Err(MovementFailure::PathNotFound);
+        }
+        self.pathfinding_ops_budget_remaining -= allowed_ops;
+
+        if self.is_over_tick_limit() {
+            return Err(MovementFailure::PathNotFound);
+        }
+
+        let tick_check = self.tick_limit.as_ref().map(|(g, l)| (&**g, *l));
         let cost_matrix_system = &mut self.cost_matrix_system;
 
         let result = self.pathfinder.search(
@@ -1113,6 +1258,11 @@ where
             destination,
             range,
             &mut |room_name: RoomName| -> Option<LocalCostMatrix> {
+                if let Some((get_cpu, limit)) = tick_check {
+                    if (get_cpu)() >= limit {
+                        return None;
+                    }
+                }
                 if room_names.contains(&room_name) {
                     cost_matrix_system
                         .build_local_cost_matrix(room_name, &cost_matrix_options)
@@ -1121,7 +1271,7 @@ where
                     None
                 }
             },
-            max_ops,
+            allowed_ops,
             cost_matrix_options.plains_cost,
             cost_matrix_options.swamp_cost,
         );
