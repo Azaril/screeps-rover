@@ -306,7 +306,22 @@ pub struct MovementSystem<'a, Handle> {
     /// When set, do not start pathfinding unless (used + headroom) <= max_cpu. Prevents one unbounded find_route
     /// from blowing the cap when we were just under it (e.g. at 79 CPU with cap 80, one pathfind can use 100+).
     pathfinding_headroom: Option<f64>,
+    /// Repaths performed this tick (reset in process(); read via tick_stats()).
+    repaths_this_tick: u32,
     phantom: std::marker::PhantomData<Handle>,
+}
+
+/// Per-tick movement telemetry, read after `process()` (host telemetry
+/// consumers — e.g. ibex's seg-57 metrics block).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MovementTickStats {
+    /// The configured per-tick pathfinding ops budget.
+    pub ops_budget_cap: u32,
+    /// Ops actually consumed by pathfinding this tick.
+    pub ops_consumed: u32,
+    /// Paths regenerated this tick (stuck + expiry repaths; first-time
+    /// paths are not repaths).
+    pub repaths: u32,
 }
 
 #[cfg_attr(feature = "profile", screeps_timing_annotate::timing)]
@@ -333,6 +348,7 @@ where
             tick_limit: None,
             movement_cpu_cap: None,
             pathfinding_headroom: None,
+            repaths_this_tick: 0,
             phantom: std::marker::PhantomData,
         }
     }
@@ -353,6 +369,17 @@ where
     /// for all pathfinding this tick. Applies to every pathfinding call including first-time paths.
     pub fn set_pathfinding_ops_budget(&mut self, ops: u32) {
         self.pathfinding_ops_budget_cap = ops;
+    }
+
+    /// Per-tick telemetry for the LAST `process()` call.
+    pub fn tick_stats(&self) -> MovementTickStats {
+        MovementTickStats {
+            ops_budget_cap: self.pathfinding_ops_budget_cap,
+            ops_consumed: self
+                .pathfinding_ops_budget_cap
+                .saturating_sub(self.pathfinding_ops_budget_remaining),
+            repaths: self.repaths_this_tick,
+        }
     }
 
     /// Set a hard cap on CPU the movement system may use this tick. Once (get_cpu() - start_cpu) >= max_cpu,
@@ -445,6 +472,7 @@ where
 
         // Reset per-tick pathfinding ops budget so we don't exhaust CPU (1 op ≈ 0.001 CPU).
         self.pathfinding_ops_budget_remaining = self.pathfinding_ops_budget_cap;
+        self.repaths_this_tick = 0;
 
         // --- Pass 0: Dependency analysis for Follow intents ---
         let (sorted_entities, broken_follows) = topological_sort_follows(&data.requests);
@@ -933,6 +961,7 @@ where
 
                     let mut new_stuck_state = stuck_state_for_gen.clone();
                     new_stuck_state.repath_count = new_stuck_state.repath_count.saturating_add(1);
+                    self.repaths_this_tick = self.repaths_this_tick.saturating_add(1);
 
                     creep_data.path_data = Some(CreepPathData {
                         destination,
