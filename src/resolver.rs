@@ -795,3 +795,120 @@ impl DirectionExt for Direction {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pos(x: u8, y: u8) -> Position {
+        Position::new(
+            RoomCoordinate::new(x).unwrap(),
+            RoomCoordinate::new(y).unwrap(),
+            "W0N0".parse().unwrap(),
+        )
+    }
+
+    fn occupant(at: Position) -> ResolvedCreep<u32> {
+        ResolvedCreep {
+            entity: 1,
+            current_pos: at,
+            desired_pos: None,
+            priority: MovementPriority::Low,
+            allow_shove: true,
+            allow_swap: false,
+            stuck_ticks: 0,
+            resolved: false,
+            final_pos: at,
+            has_request: false,
+            anchor: None,
+        }
+    }
+
+    // The walkability predicate is the resolver's only view of blocking
+    // structures (IBEX-040): shove must land only on tiles it allows.
+    #[test]
+    fn shove_lands_only_on_walkable_tiles() {
+        let origin = pos(10, 10);
+        let open = pos(11, 10);
+        let mut creeps: HashMap<u32, ResolvedCreep<u32>> = HashMap::new();
+        creeps.insert(1, occupant(origin));
+
+        // Every neighbor is structure-blocked except one.
+        let is_tile_walkable = |p: Position| -> bool { p == open };
+        let shover = ShoveContext {
+            priority: MovementPriority::High,
+            stuck_ticks: 0,
+        };
+
+        let shoved = try_shove(
+            1,
+            &mut creeps,
+            &HashMap::new(),
+            &is_tile_walkable,
+            0,
+            DEFAULT_MAX_SHOVE_DEPTH,
+            shover,
+        );
+
+        assert!(shoved);
+        assert_eq!(creeps[&1].final_pos, open);
+    }
+
+    #[test]
+    fn shove_fails_rather_than_landing_on_a_blocked_tile() {
+        let origin = pos(10, 10);
+        let mut creeps: HashMap<u32, ResolvedCreep<u32>> = HashMap::new();
+        creeps.insert(1, occupant(origin));
+
+        // Structures block every neighbor.
+        let is_tile_walkable = |_: Position| -> bool { false };
+        let shover = ShoveContext {
+            priority: MovementPriority::High,
+            stuck_ticks: 0,
+        };
+
+        let shoved = try_shove(
+            1,
+            &mut creeps,
+            &HashMap::new(),
+            &is_tile_walkable,
+            0,
+            DEFAULT_MAX_SHOVE_DEPTH,
+            shover,
+        );
+
+        assert!(!shoved);
+        assert_eq!(creeps[&1].final_pos, origin);
+        assert!(!creeps[&1].resolved);
+    }
+
+    #[test]
+    fn local_avoidance_respects_the_walkability_predicate() {
+        let creep_pos = pos(10, 10);
+        let blocked_tile = pos(11, 10);
+        let allowed = pos(11, 11);
+
+        let is_tile_walkable = |p: Position| -> bool { p == allowed };
+
+        let result = try_local_avoidance::<u32>(
+            creep_pos,
+            blocked_tile,
+            &std::collections::HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &is_tile_walkable,
+        );
+        assert_eq!(result, Some(allowed));
+
+        let nothing_walkable = |_: Position| -> bool { false };
+        let result = try_local_avoidance::<u32>(
+            creep_pos,
+            blocked_tile,
+            &std::collections::HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &nothing_walkable,
+        );
+        assert_eq!(result, None);
+    }
+}

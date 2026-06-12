@@ -632,8 +632,53 @@ where
         let idle_creep_positions: HashMap<Position, Handle> = HashMap::new();
 
         if !self.is_over_tick_limit() && !self.is_over_movement_cap() {
+            // Blocking-structure layer for shove/local-avoidance (IBEX-040):
+            // terrain alone lets the resolver shove a creep onto a tile
+            // occupied by a blocking structure (wall, spawn, hostile rampart)
+            // or a blocked construction site, wasting the tick. Pre-build one
+            // cached-layer cost matrix per involved room — the closure below
+            // cannot call the &mut builder itself. Creep layers stay OFF: the
+            // resolver models creep occupancy on its own, and a friendly-creep
+            // MAX cost would wrongly veto shove/swap targets.
+            let structure_options = CostMatrixOptions {
+                structures: true,
+                construction_sites: true,
+                friendly_creeps: false,
+                hostile_creeps: false,
+                source_keeper_aggro: false,
+                ..Default::default()
+            };
+
+            let involved_rooms: HashSet<RoomName> = resolved_creeps
+                .values()
+                .flat_map(|creep| {
+                    std::iter::once(creep.current_pos.room_name())
+                        .chain(creep.desired_pos.map(|pos| pos.room_name()))
+                })
+                .collect();
+
+            let mut structure_costs: HashMap<RoomName, LocalCostMatrix> = HashMap::new();
+            for room_name in involved_rooms {
+                // Rooms without structure data (no visibility this tick) get
+                // an empty matrix, which degrades to the terrain-only check.
+                if let Ok(matrix) = self
+                    .cost_matrix_system
+                    .build_local_cost_matrix(room_name, &structure_options)
+                {
+                    structure_costs.insert(room_name, matrix);
+                }
+            }
+
             let pathfinder = &mut *self.pathfinder;
-            let is_tile_walkable = |pos: Position| -> bool { pathfinder.is_tile_walkable(pos) };
+            let is_tile_walkable = |pos: Position| -> bool {
+                if !pathfinder.is_tile_walkable(pos) {
+                    return false;
+                }
+                structure_costs
+                    .get(&pos.room_name())
+                    .map(|matrix| matrix.get(pos.xy()) < u8::MAX)
+                    .unwrap_or(true)
+            };
 
             resolve_conflicts(
                 &mut resolved_creeps,
