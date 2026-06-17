@@ -50,6 +50,47 @@ fn to_pos(x: u8, y: u8, room: RoomName) -> Position {
     Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room)
 }
 
+/// Room-agnostic `RoomXY` for indexing a (room-independent) cost matrix.
+fn rxy(x: usize, y: usize) -> RoomXY {
+    RoomXY::checked_new(x as u8, y as u8).expect("0..50 in bounds")
+}
+
+/// The **"moving-maximum" footprint transform** (P2.M1): given a per-tile cost matrix, produce one
+/// where each tile's value is the MAX cost over the `w`×`h` block anchored at that tile (extending
+/// toward +x/+y). A block cell that is impassable (255) — or a block that would run off the room —
+/// makes the **anchor** impassable. Pathfinding the anchor over the transformed matrix routes a
+/// `w`×`h` body (a squad's bounding box) as a unit: it never threads a gap narrower than its
+/// footprint and never clips an obstacle. Generalizes the (dead) 2×2 `apply_quad_cost_overlay` to
+/// arbitrary W×H. Pair with [`LocalPathfinder`] (search the anchor over the transformed matrix).
+pub fn moving_maximum(cm: &LocalCostMatrix, w: u8, h: u8) -> LocalCostMatrix {
+    let (w, h) = (w.max(1) as usize, h.max(1) as usize);
+    let mut out = LocalCostMatrix::new();
+    for ax in 0..DIM {
+        for ay in 0..DIM {
+            let val = if ax + w > DIM || ay + h > DIM {
+                IMPASSABLE // the footprint would extend off the room
+            } else {
+                let mut m = 0u8;
+                'block: for x in ax..ax + w {
+                    for y in ay..ay + h {
+                        let c = cm.get(rxy(x, y));
+                        if c == IMPASSABLE {
+                            m = IMPASSABLE;
+                            break 'block;
+                        }
+                        m = m.max(c);
+                    }
+                }
+                m
+            };
+            if val != 0 {
+                out.set(rxy(ax, ay), val);
+            }
+        }
+    }
+    out
+}
+
 /// Read the cost matrix into a dense grid once (avoids per-expansion `RoomXY` construction).
 fn snapshot(cm: &LocalCostMatrix, room: RoomName) -> Box<Grid> {
     let mut grid = Box::new([[0u8; DIM]; DIM]);
@@ -347,6 +388,43 @@ mod tests {
         assert!(!r.incomplete, "open room → can flee out of range");
         let end = *r.path.last().unwrap();
         assert!(end.get_range_to(threat) > 3, "ends outside the flee range");
+    }
+
+    #[test]
+    fn moving_maximum_blocks_anchors_that_would_clip_a_wall() {
+        let mut cm = empty_cm();
+        block(&mut cm, 10, 10);
+        let mm = moving_maximum(&cm, 2, 2);
+        // Every 2×2 block containing (10,10) — anchors (9,9)/(9,10)/(10,9)/(10,10) — is impassable.
+        for &(ax, ay) in &[(9u8, 9u8), (9, 10), (10, 9), (10, 10)] {
+            assert_eq!(mm.get(pos(ax, ay).xy()), IMPASSABLE, "2×2 anchor ({},{}) clips the wall", ax, ay);
+        }
+        assert_eq!(mm.get(pos(7, 7).xy()), 0, "a block clear of the wall stays passable");
+    }
+
+    #[test]
+    fn moving_maximum_seals_a_one_wide_gap_for_a_2x2() {
+        // Wall column x=10 with a single-tile gap at (10,25): a 2×2 body cannot thread it.
+        let mut cm = empty_cm();
+        for y in 0..=49u8 {
+            if y != 25 {
+                block(&mut cm, 10, y);
+            }
+        }
+        let mm2 = moving_maximum(&cm, 2, 2);
+        for &(ax, ay) in &[(9u8, 24u8), (9, 25), (10, 24), (10, 25)] {
+            assert_eq!(mm2.get(pos(ax, ay).xy()), IMPASSABLE, "2×2 can't pass the 1-wide gap (anchor {},{})", ax, ay);
+        }
+        // A 1×1 body still fits the gap.
+        assert_eq!(moving_maximum(&cm, 1, 1).get(pos(10, 25).xy()), 0, "1×1 fits the gap");
+    }
+
+    #[test]
+    fn moving_maximum_blocks_off_room_footprints() {
+        let mm = moving_maximum(&empty_cm(), 2, 2);
+        assert_eq!(mm.get(pos(49, 25).xy()), IMPASSABLE, "2×2 runs off the +x edge");
+        assert_eq!(mm.get(pos(25, 49).xy()), IMPASSABLE, "2×2 runs off the +y edge");
+        assert_eq!(mm.get(pos(48, 48).xy()), 0, "fits just inside the corner");
     }
 
     #[test]

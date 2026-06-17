@@ -17,7 +17,7 @@ pub mod screeps_impl;
 pub use costmatrix::*;
 pub use costmatrixsystem::*;
 pub use error::*;
-pub use local_pathfinder::LocalPathfinder;
+pub use local_pathfinder::{moving_maximum, LocalPathfinder};
 pub use location::*;
 pub use movementrequest::*;
 pub use movementresult::*;
