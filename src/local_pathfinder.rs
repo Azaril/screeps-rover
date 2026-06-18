@@ -129,7 +129,10 @@ fn reconstruct(came: &CameFrom, origin: (u8, u8), node: (u8, u8), room: RoomName
 
 impl LocalPathfinder {
     /// Shared cost-bounded grid search. `satisfied(x,y)` is the goal predicate; `score(x,y)` ranks
-    /// best-effort tiles (lower is better — distance-to-target for seek, negated-distance for flee).
+    /// best-effort tiles (lower is better — distance-to-target for seek, negated-distance for flee,
+    /// an arbitrary cost for scored). `dijkstra` forces a uniform-cost flood (priority = `g`,
+    /// exploring outward by path cost and evaluating `score` at each tile) — used by the scored
+    /// search where `score` is an arbitrary positive cost, not an admissible distance heuristic.
     /// Returns `(path, incomplete)`.
     #[allow(clippy::too_many_arguments)]
     fn run<S, B>(
@@ -138,6 +141,7 @@ impl LocalPathfinder {
         room: RoomName,
         max_ops: u32,
         plain_cost: u8,
+        dijkstra: bool,
         satisfied: S,
         score: B,
     ) -> (Vec<Position>, bool)
@@ -145,16 +149,17 @@ impl LocalPathfinder {
         S: Fn(i32, i32) -> bool,
         B: Fn(i32, i32) -> i64,
     {
+        let priority = |x: u8, y: u8, g: u32| if dijkstra { g } else { score_priority(&score, x, y, g) };
         let (ox, oy) = origin;
         if satisfied(ox as i32, oy as i32) {
             return (Vec::new(), false); // already there
         }
         let mut g = Box::new([[u32::MAX; DIM]; DIM]);
         let mut came: Box<CameFrom> = Box::new([[None; DIM]; DIM]);
-        // Min-heap on (priority, g, x, y). For A* priority = g + h; for Dijkstra priority = g.
+        // Min-heap on (priority, g, x, y). A* priority = g + h; Dijkstra priority = g.
         let mut heap: BinaryHeap<Reverse<(u32, u32, u8, u8)>> = BinaryHeap::new();
         g[ox as usize][oy as usize] = 0;
-        heap.push(Reverse((score_priority(&score, ox, oy, 0), 0, ox, oy)));
+        heap.push(Reverse((priority(ox, oy, 0), 0, ox, oy)));
         let mut best = (score(ox as i32, oy as i32), ox, oy);
         let mut ops = 0u32;
         while let Some(Reverse((_pri, gc, x, y))) = heap.pop() {
@@ -187,7 +192,7 @@ impl LocalPathfinder {
                 if ng < g[nx][ny] {
                     g[nx][ny] = ng;
                     came[nx][ny] = Some((x, y));
-                    heap.push(Reverse((score_priority(&score, nx as u8, ny as u8, ng), ng, nx as u8, ny as u8)));
+                    heap.push(Reverse((priority(nx as u8, ny as u8, ng), ng, nx as u8, ny as u8)));
                 }
             }
         }
@@ -227,7 +232,7 @@ impl PathfindingProvider for LocalPathfinder {
         let satisfied = |x: i32, y: i32| cheby(x, y, gx, gy) <= range;
         let score = |x: i32, y: i32| cheby(x, y, gx, gy) as i64; // minimize distance to goal
         let (path, incomplete) =
-            Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, satisfied, score);
+            Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, false, satisfied, score);
         PathfindingResult { path, incomplete }
     }
 
@@ -259,13 +264,36 @@ impl PathfindingProvider for LocalPathfinder {
             // Goal: outside EVERY flee range. Best-effort: maximize the min distance (score negated).
             let satisfied = |x: i32, y: i32| local.iter().all(|(gx, gy, r)| cheby(x, y, *gx, *gy) > *r);
             let score = |x: i32, y: i32| -(min_dist(x, y) as i64);
-            Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, satisfied, score)
+            Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, false, satisfied, score)
         } else {
             // Goal: within ANY goal's range. Best-effort: minimize the min distance.
             let satisfied = |x: i32, y: i32| local.iter().any(|(gx, gy, r)| cheby(x, y, *gx, *gy) <= *r);
             let score = |x: i32, y: i32| min_dist(x, y) as i64;
-            Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, satisfied, score)
+            Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, false, satisfied, score)
         };
+        PathfindingResult { path, incomplete }
+    }
+
+    fn search_scored(
+        &mut self,
+        origin: Position,
+        room_callback: &mut dyn FnMut(RoomName) -> Option<LocalCostMatrix>,
+        max_ops: u32,
+        plain_cost: u8,
+        _swamp_cost: u8,
+        cost: &dyn Fn(Position) -> i64,
+    ) -> PathfindingResult {
+        let room = origin.room_name();
+        let grid = match room_callback(room) {
+            Some(cm) => snapshot(&cm, room),
+            None => return PathfindingResult { path: Vec::new(), incomplete: true },
+        };
+        // Flood the bounded region (never "satisfied" → run to max_ops or exhaustion) by path cost
+        // (Dijkstra), evaluating the caller's tile cost at each; `run` returns the min-cost tile seen.
+        let satisfied = |_x: i32, _y: i32| false;
+        let score = |x: i32, y: i32| cost(to_pos(x as u8, y as u8, room));
+        let (path, incomplete) =
+            Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, true, satisfied, score);
         PathfindingResult { path, incomplete }
     }
 
@@ -425,6 +453,49 @@ mod tests {
         assert_eq!(mm.get(pos(49, 25).xy()), IMPASSABLE, "2×2 runs off the +x edge");
         assert_eq!(mm.get(pos(25, 49).xy()), IMPASSABLE, "2×2 runs off the +y edge");
         assert_eq!(mm.get(pos(48, 48).xy()), 0, "fits just inside the corner");
+    }
+
+    #[test]
+    fn search_scored_returns_min_cost_reachable_tile() {
+        // Cost = distance to a goal tile (min, 0, at the goal). Open room → the search reaches it.
+        let mut pf = LocalPathfinder;
+        let mut cb = |_r| Some(empty_cm());
+        let goal = pos(30, 25);
+        let cost = |p: Position| p.get_range_to(goal) as i64;
+        let r = pf.search_scored(pos(25, 25), &mut cb, 5000, 1, 5, &cost);
+        assert!(!r.path.is_empty(), "moves toward the min-cost tile");
+        assert_eq!(*r.path.last().unwrap(), goal, "ends at the min-cost (zero) tile");
+    }
+
+    #[test]
+    fn search_scored_bounded_by_max_ops_returns_best_so_far() {
+        // Tiny op budget: returns the best tile explored so far (toward lower cost), incomplete.
+        let mut pf = LocalPathfinder;
+        let mut cb = |_r| Some(empty_cm());
+        let goal = pos(5, 5);
+        let cost = |p: Position| p.get_range_to(goal) as i64;
+        let origin = pos(25, 25);
+        let r = pf.search_scored(origin, &mut cb, 10, 1, 5, &cost);
+        assert!(r.incomplete, "bounded by max_ops");
+        let end = *r.path.last().expect("a better tile than origin was explored");
+        assert!(cost(end) < cost(origin), "moved toward lower cost (best so far)");
+    }
+
+    #[test]
+    fn search_scored_never_returns_an_unreachable_tile() {
+        // Origin fully walled in; the global min-cost tile is faraway + unreachable → it holds.
+        let mut cbf = |_r| {
+            let mut cm = empty_cm();
+            for (x, y) in [(24, 24), (25, 24), (26, 24), (24, 25), (26, 25), (24, 26), (25, 26), (26, 26)] {
+                block(&mut cm, x, y);
+            }
+            Some(cm)
+        };
+        let mut pf = LocalPathfinder;
+        let goal = pos(45, 45);
+        let cost = |p: Position| p.get_range_to(goal) as i64;
+        let r = pf.search_scored(pos(25, 25), &mut cbf, 2000, 1, 5, &cost);
+        assert!(r.path.is_empty(), "sealed origin → the unreachable low-cost tile is never returned (holds)");
     }
 
     #[test]

@@ -116,6 +116,22 @@ impl PathfindingProvider for ScreepsPathfinder {
         }
     }
 
+    fn search_scored(
+        &mut self,
+        origin: Position,
+        room_callback: &mut dyn FnMut(RoomName) -> Option<LocalCostMatrix>,
+        max_ops: u32,
+        plain_cost: u8,
+        swamp_cost: u8,
+        cost: &dyn Fn(Position) -> i64,
+    ) -> PathfindingResult {
+        // A bounded single-room scored search has no direct server `PathFinder` analog (the server
+        // PF minimizes distance-to-goal, not an arbitrary per-tile cost). Delegate to the pure
+        // headless `LocalPathfinder` over the same cost matrix — cheap (one bounded room flood) and
+        // it makes the live kite/flee positioning byte-identical to what the sim self-play validates.
+        crate::LocalPathfinder.search_scored(origin, room_callback, max_ops, plain_cost, swamp_cost, cost)
+    }
+
     fn find_route(
         &self,
         from: RoomName,
