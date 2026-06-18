@@ -198,6 +198,38 @@ impl LocalPathfinder {
         }
         (reconstruct(&came, origin, (best.1, best.2), room), true)
     }
+
+    /// Bounded **scored** single-room search: flood outward from `origin` (cost-bounded by `max_ops`,
+    /// Dijkstra by path cost) and return the path (origin-exclusive) to the reachable tile MINIMIZING
+    /// `cost` (lower = more desirable); an empty path ⇒ holding the origin is already optimal.
+    ///
+    /// This is an **inherent** method, not a [`PathfindingProvider`] one: the scored-DESTINATION
+    /// search has no server-`PathFinder` analog (that API paths to a goal / flees from goals; it
+    /// cannot rank destinations by an arbitrary score), so it is intrinsically the headless local
+    /// flood. Both the live bot and the sim run THIS over their respective cost matrices — kiting is
+    /// single-room (cross-room travel is the separate `MoveToRoom` phase). The caller (combat)
+    /// supplies the pricing; the pathfinder owns the search.
+    pub fn search_scored(
+        &self,
+        origin: Position,
+        room_callback: &mut dyn FnMut(RoomName) -> Option<LocalCostMatrix>,
+        max_ops: u32,
+        plain_cost: u8,
+        cost: &dyn Fn(Position) -> i64,
+    ) -> PathfindingResult {
+        let room = origin.room_name();
+        let grid = match room_callback(room) {
+            Some(cm) => snapshot(&cm, room),
+            None => return PathfindingResult { path: Vec::new(), incomplete: true },
+        };
+        // Never "satisfied" → flood to max_ops / exhaustion by path cost; `run` returns the min-cost
+        // tile seen (its `best` tracking), so the path's last tile is the chosen goal.
+        let satisfied = |_x: i32, _y: i32| false;
+        let score = |x: i32, y: i32| cost(to_pos(x as u8, y as u8, room));
+        let (path, incomplete) =
+            Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, true, satisfied, score);
+        PathfindingResult { path, incomplete }
+    }
 }
 
 /// A* priority for seek (g + admissible h); for flee `score` is negative so the heap still explores
@@ -271,29 +303,6 @@ impl PathfindingProvider for LocalPathfinder {
             let score = |x: i32, y: i32| min_dist(x, y) as i64;
             Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, false, satisfied, score)
         };
-        PathfindingResult { path, incomplete }
-    }
-
-    fn search_scored(
-        &mut self,
-        origin: Position,
-        room_callback: &mut dyn FnMut(RoomName) -> Option<LocalCostMatrix>,
-        max_ops: u32,
-        plain_cost: u8,
-        _swamp_cost: u8,
-        cost: &dyn Fn(Position) -> i64,
-    ) -> PathfindingResult {
-        let room = origin.room_name();
-        let grid = match room_callback(room) {
-            Some(cm) => snapshot(&cm, room),
-            None => return PathfindingResult { path: Vec::new(), incomplete: true },
-        };
-        // Flood the bounded region (never "satisfied" → run to max_ops or exhaustion) by path cost
-        // (Dijkstra), evaluating the caller's tile cost at each; `run` returns the min-cost tile seen.
-        let satisfied = |_x: i32, _y: i32| false;
-        let score = |x: i32, y: i32| cost(to_pos(x as u8, y as u8, room));
-        let (path, incomplete) =
-            Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, true, satisfied, score);
         PathfindingResult { path, incomplete }
     }
 
@@ -458,11 +467,11 @@ mod tests {
     #[test]
     fn search_scored_returns_min_cost_reachable_tile() {
         // Cost = distance to a goal tile (min, 0, at the goal). Open room → the search reaches it.
-        let mut pf = LocalPathfinder;
+        let pf = LocalPathfinder;
         let mut cb = |_r| Some(empty_cm());
         let goal = pos(30, 25);
         let cost = |p: Position| p.get_range_to(goal) as i64;
-        let r = pf.search_scored(pos(25, 25), &mut cb, 5000, 1, 5, &cost);
+        let r = pf.search_scored(pos(25, 25), &mut cb, 5000, 1, &cost);
         assert!(!r.path.is_empty(), "moves toward the min-cost tile");
         assert_eq!(*r.path.last().unwrap(), goal, "ends at the min-cost (zero) tile");
     }
@@ -470,12 +479,12 @@ mod tests {
     #[test]
     fn search_scored_bounded_by_max_ops_returns_best_so_far() {
         // Tiny op budget: returns the best tile explored so far (toward lower cost), incomplete.
-        let mut pf = LocalPathfinder;
+        let pf = LocalPathfinder;
         let mut cb = |_r| Some(empty_cm());
         let goal = pos(5, 5);
         let cost = |p: Position| p.get_range_to(goal) as i64;
         let origin = pos(25, 25);
-        let r = pf.search_scored(origin, &mut cb, 10, 1, 5, &cost);
+        let r = pf.search_scored(origin, &mut cb, 10, 1, &cost);
         assert!(r.incomplete, "bounded by max_ops");
         let end = *r.path.last().expect("a better tile than origin was explored");
         assert!(cost(end) < cost(origin), "moved toward lower cost (best so far)");
@@ -491,10 +500,10 @@ mod tests {
             }
             Some(cm)
         };
-        let mut pf = LocalPathfinder;
+        let pf = LocalPathfinder;
         let goal = pos(45, 45);
         let cost = |p: Position| p.get_range_to(goal) as i64;
-        let r = pf.search_scored(pos(25, 25), &mut cbf, 2000, 1, 5, &cost);
+        let r = pf.search_scored(pos(25, 25), &mut cbf, 2000, 1, &cost);
         assert!(r.path.is_empty(), "sealed origin → the unreachable low-cost tile is never returned (holds)");
     }
 

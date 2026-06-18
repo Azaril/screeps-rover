@@ -43,23 +43,6 @@ pub trait PathfindingProvider {
         swamp_cost: u8,
     ) -> PathfindingResult;
 
-    /// Bounded **scored** single-room search: flood outward from `origin` (cost-bounded by
-    /// `max_ops`) and return the path (origin-exclusive) to the reachable tile MINIMIZING `cost`
-    /// (lower = more desirable). Generalizes the fixed seek/flee score of [`Self::search_many`] to an
-    /// arbitrary caller-supplied tile cost — the caller (combat) supplies the *pricing* (e.g. a
-    /// kite/flee position scored by safety + cohesion + value), the pathfinder owns the *search*.
-    /// An empty path means holding the origin is already optimal. `incomplete` when `max_ops` bounded
-    /// the flood (the best tile seen so far is still returned).
-    fn search_scored(
-        &mut self,
-        origin: Position,
-        room_callback: &mut dyn FnMut(RoomName) -> Option<LocalCostMatrix>,
-        max_ops: u32,
-        plain_cost: u8,
-        swamp_cost: u8,
-        cost: &dyn Fn(Position) -> i64,
-    ) -> PathfindingResult;
-
     /// Find a room-level route (equivalent to `game::map::find_route`).
     fn find_route(
         &self,
