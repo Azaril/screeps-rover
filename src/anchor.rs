@@ -51,6 +51,9 @@ pub struct AnchorPath {
     /// Cached steps (origin-exclusive); `cached[index..]` not yet walked.
     cached: Vec<Position>,
     index: usize,
+    /// The footprint the cached path was planned for; a change invalidates the cache (so switching
+    /// box↔single-file actually re-tests whether the new footprint can route).
+    footprint: (u8, u8),
     /// Consecutive ticks with no progress — drives stale re-path and is the caller's give-up signal.
     pub stuck_ticks: u16,
     /// Ticks remaining before re-searching after a failed path (throttle while blocked).
@@ -64,6 +67,7 @@ impl AnchorPath {
             destination,
             cached: Vec::new(),
             index: 0,
+            footprint: (0, 0), // sentinel: forces a path on the first advance
             stuck_ticks: 0,
             repath_cooldown: 0,
         }
@@ -83,8 +87,12 @@ impl AnchorPath {
         if self.repath_cooldown > 0 {
             self.repath_cooldown -= 1;
         }
-        if destination != self.destination {
+        // A changed destination OR footprint invalidates the cache: the new goal/size must be
+        // re-planned (so a box→single-file switch genuinely re-tests whether the box can route,
+        // rather than blindly following the old path).
+        if destination != self.destination || footprint != self.footprint {
             self.destination = destination;
+            self.footprint = footprint;
             self.invalidate();
             self.repath_cooldown = 0;
         }
