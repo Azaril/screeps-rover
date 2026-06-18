@@ -18,7 +18,7 @@ pub mod screeps_impl;
 pub use costmatrix::*;
 pub use costmatrixsystem::*;
 pub use error::*;
-pub use anchor::AnchorPath;
+pub use anchor::{AnchorOutcome, AnchorPath};
 pub use local_pathfinder::{moving_maximum, LocalPathfinder};
 pub use location::*;
 pub use movementrequest::*;
