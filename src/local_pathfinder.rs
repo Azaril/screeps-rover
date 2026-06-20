@@ -42,6 +42,36 @@ type CameFrom = [[Option<(u8, u8)>; DIM]; DIM];
 /// A headless [`PathfindingProvider`] (see module docs). Zero-sized; construct with `LocalPathfinder`.
 pub struct LocalPathfinder;
 
+/// A source for the multi-source reachability flood ([`LocalPathfinder::reachability_from`], ADR 0019
+/// §2.2): a creep's position + its fatigue **cadence** — how many ticks it spends to step one tile
+/// (`>=1`; lower = faster, so its wave spreads sooner). The caller derives `step_ticks` from the
+/// engine body (MOVE parts vs body weight); rover stays speed-agnostic. v1 applies one cadence over
+/// all walkable terrain (terrain-weighted ticks — swamp slowdown — is a documented follow-up; the
+/// dominant signals captured are source SPEED and wall ROUTING).
+#[derive(Clone, Copy, Debug)]
+pub struct ReachSource {
+    pub pos: Position,
+    pub step_ticks: u32,
+}
+
+/// Per-tile "soonest ANY source can reach here", in ticks (`u32::MAX` = unreachable; a source tile
+/// is 0). The shared "how soon is danger here" map — built once per room, read by every block.
+pub struct ReachabilityMap {
+    ticks: Box<[[u32; DIM]; DIM]>,
+}
+
+impl ReachabilityMap {
+    /// Soonest a source can reach `pos`, in ticks; `None` if unreachable within the op budget.
+    pub fn ticks_to_reach(&self, pos: Position) -> Option<u32> {
+        let v = self.ticks[pos.x().u8() as usize][pos.y().u8() as usize];
+        (v != u32::MAX).then_some(v)
+    }
+    /// Raw ticks at `(x,y)` (`u32::MAX` = unreachable) — the hot per-tile read for tile scoring.
+    pub fn ticks_xy(&self, x: u8, y: u8) -> u32 {
+        self.ticks[x as usize][y as usize]
+    }
+}
+
 fn cheby(ax: i32, ay: i32, bx: i32, by: i32) -> u32 {
     (ax - bx).abs().max((ay - by).abs()) as u32
 }
@@ -229,6 +259,75 @@ impl LocalPathfinder {
         let (path, incomplete) =
             Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, true, satisfied, score);
         PathfindingResult { path, incomplete }
+    }
+
+    /// **Multi-source weighted Dijkstra** (ADR 0019 §2.2 — the operator's flood-fill): for every tile,
+    /// the SOONEST (in ticks) ANY `source` can reach it. Each source's wave advances at its own
+    /// `step_ticks` cadence (a fast chaser's danger spreads faster) over the walkable grid
+    /// (`IMPASSABLE` tiles block; the matrix value otherwise gates only walkability in v1). One flood
+    /// produces the whole map in `O(2500 log)` regardless of source count — the shared "how soon is
+    /// danger here" input every block scores against, NOT a per-creep search.
+    ///
+    /// A single heap carries each entry's owning source index, so a tile expands at the cadence of the
+    /// wave that reached it soonest; first-pop settles the per-tile min over all sources (the standard
+    /// multi-source Dijkstra argument). Bounded by `max_ops` settled tiles. Lives here, not in the
+    /// harness — search is the pathfinding system's job (the no-one-off rule); the caller (combat)
+    /// supplies the speed model. Same routine runs live and in the sim over their cost matrices.
+    pub fn reachability_from(
+        &self,
+        sources: &[ReachSource],
+        room: RoomName,
+        room_callback: &mut dyn FnMut(RoomName) -> Option<LocalCostMatrix>,
+        max_ops: u32,
+    ) -> ReachabilityMap {
+        let mut ticks = Box::new([[u32::MAX; DIM]; DIM]);
+        let grid = match room_callback(room) {
+            Some(cm) => snapshot(&cm, room),
+            None => return ReachabilityMap { ticks },
+        };
+        // (g_ticks, x, y, src_idx). Min-heap by g; src_idx selects the expansion cadence.
+        let mut heap: BinaryHeap<Reverse<(u32, u8, u8, u32)>> = BinaryHeap::new();
+        for (i, s) in sources.iter().enumerate() {
+            if s.pos.room_name() != room {
+                continue;
+            }
+            let (x, y) = (s.pos.x().u8(), s.pos.y().u8());
+            if grid[x as usize][y as usize] == IMPASSABLE {
+                continue; // a source standing on an impassable tile seeds nothing
+            }
+            if ticks[x as usize][y as usize] != 0 {
+                ticks[x as usize][y as usize] = 0;
+                heap.push(Reverse((0, x, y, i as u32)));
+            }
+        }
+        let mut ops = 0u32;
+        while let Some(Reverse((g, x, y, si))) = heap.pop() {
+            if g > ticks[x as usize][y as usize] {
+                continue; // stale heap entry
+            }
+            ops += 1;
+            if ops >= max_ops {
+                break;
+            }
+            let step = sources[si as usize].step_ticks.max(1);
+            for (dx, dy) in NEIGHBORS {
+                let nx = x as i32 + dx;
+                let ny = y as i32 + dy;
+                if !(0..DIM as i32).contains(&nx) || !(0..DIM as i32).contains(&ny) {
+                    continue;
+                }
+                let (nxu, nyu) = (nx as usize, ny as usize);
+                if grid[nxu][nyu] == IMPASSABLE {
+                    continue;
+                }
+                let ng = g.saturating_add(step);
+                if ng < ticks[nxu][nyu] {
+                    ticks[nxu][nyu] = ng;
+                    heap.push(Reverse((ng, nx as u8, ny as u8, si)));
+                }
+            }
+        }
+        ReachabilityMap { ticks }
     }
 }
 
@@ -525,5 +624,68 @@ mod tests {
         let r = pf.search(pos(5, 5), pos(9, 5), 0, &mut cbf, 5000, 1, 10);
         assert!(!r.incomplete);
         assert!(r.path.iter().any(|p| p.x().u8() == 7 && p.y().u8() == 5), "routes through the cheap gap");
+    }
+
+    // ── reachability_from (ADR 0019 §2.2 multi-source flood) ──
+
+    #[test]
+    fn reachability_single_source_is_chebyshev_times_cadence() {
+        let pf = LocalPathfinder;
+        let mut cb = |_r| Some(empty_cm());
+        let r = pf.reachability_from(&[ReachSource { pos: pos(25, 25), step_ticks: 2 }], room(), &mut cb, 5000);
+        assert_eq!(r.ticks_to_reach(pos(25, 25)), Some(0), "source tile is 0");
+        assert_eq!(r.ticks_to_reach(pos(28, 25)), Some(6), "3 tiles away x 2 ticks/step");
+        assert_eq!(r.ticks_to_reach(pos(28, 28)), Some(6), "diagonal: still 3 Chebyshev steps x 2");
+    }
+
+    #[test]
+    fn reachability_takes_the_soonest_over_sources() {
+        let pf = LocalPathfinder;
+        let mut cb = |_r| Some(empty_cm());
+        // A far-but-fast source vs a near-but-slow one; per tile we get the soonest.
+        let sources = [
+            ReachSource { pos: pos(10, 25), step_ticks: 1 }, // fast
+            ReachSource { pos: pos(30, 25), step_ticks: 5 }, // slow, near the target tile
+        ];
+        let r = pf.reachability_from(&sources, room(), &mut cb, 5000);
+        // Tile (28,25): fast is 18 away x1 = 18; slow is 2 away x5 = 10 -> slow wins (10).
+        assert_eq!(r.ticks_to_reach(pos(28, 25)), Some(10));
+        // Tile (20,25): fast is 10 away x1 = 10; slow is 10 away x5 = 50 -> fast wins (10).
+        assert_eq!(r.ticks_to_reach(pos(20, 25)), Some(10));
+        // Tile (14,25): fast 4x1=4 vs slow 16x5=80 -> fast (4).
+        assert_eq!(r.ticks_to_reach(pos(14, 25)), Some(4));
+    }
+
+    #[test]
+    fn reachability_routes_around_walls() {
+        let pf = LocalPathfinder;
+        // A full vertical wall at x=20 with a single gap at (20,25): a source west of it must detour
+        // through the gap to reach the east side, so ticks exceed the straight-line Chebyshev.
+        let mut cb = |_r| {
+            let mut cm = empty_cm();
+            for y in 0..50u8 {
+                if y != 25 {
+                    block(&mut cm, 20, y);
+                }
+            }
+            Some(cm)
+        };
+        let r = pf.reachability_from(&[ReachSource { pos: pos(15, 10), step_ticks: 1 }], room(), &mut cb, 5000);
+        // (25,10) is Chebyshev 10 from the source, but the only opening is (20,25): the path must bend
+        // far south to the gap and back, so ticks are well above 10.
+        let t = r.ticks_to_reach(pos(25, 10)).expect("reachable via the gap");
+        assert!(t > 10, "detour through the gap costs more than the straight-line 10 (got {t})");
+        // The walled column (except the gap) is unreachable.
+        assert_eq!(r.ticks_to_reach(pos(20, 0)), None, "a wall tile is never reached");
+    }
+
+    #[test]
+    fn reachability_off_room_source_contributes_nothing() {
+        let pf = LocalPathfinder;
+        let mut cb = |_r| Some(empty_cm());
+        let other: RoomName = "W2N2".parse().unwrap();
+        let src = ReachSource { pos: to_pos(25, 25, other), step_ticks: 1 };
+        let r = pf.reachability_from(&[src], room(), &mut cb, 5000);
+        assert_eq!(r.ticks_to_reach(pos(25, 25)), None, "an off-room source seeds no wave in this room");
     }
 }
