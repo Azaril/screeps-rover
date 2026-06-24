@@ -47,6 +47,36 @@ fn room_linear_distance(from: RoomName, to: RoomName) -> u32 {
     (((ax - bx).abs() / 50).max((ay - by).abs() / 50)) as u32
 }
 
+/// Project `pos` into `room`: its world position clamped to `room`'s 0..=49 tile bounds. For a
+/// cross-room `pos` this is the edge tile of `room` pointing toward it (the headless MoveToRoom
+/// projection — route to this exit, then the boundary cross carries you on). Same-room → unchanged.
+pub fn project_into_room(pos: Position, room: RoomName) -> Position {
+    if pos.room_name() == room {
+        return pos;
+    }
+    let c = RoomCoordinate::new(25).expect("25");
+    let (cx, cy) = Position::new(c, c, room).world_coords();
+    let (origin_x, origin_y) = (cx - 25, cy - 25); // room's (0,0) world coord
+    let (wx, wy) = pos.world_coords();
+    let lx = (wx - origin_x).clamp(0, 49) as u8;
+    let ly = (wy - origin_y).clamp(0, 49) as u8;
+    Position::new(RoomCoordinate::new(lx).expect("clamped"), RoomCoordinate::new(ly).expect("clamped"), room)
+}
+
+/// The unit room-step `(dx, dy)` from `from` to an orthogonally-adjacent `to` (east → `(1,0)`,
+/// north → `(0,-1)`, …); `(0,0)` if not orthogonally adjacent.
+pub fn room_step_direction(from: RoomName, to: RoomName) -> (i32, i32) {
+    let c = RoomCoordinate::new(25).expect("25");
+    let (ax, ay) = Position::new(c, c, from).world_coords();
+    let (bx, by) = Position::new(c, c, to).world_coords();
+    let (dx, dy) = ((bx - ax) / 50, (by - ay) / 50);
+    if dx.abs() + dy.abs() == 1 {
+        (dx, dy)
+    } else {
+        (0, 0)
+    }
+}
+
 const DIM: usize = 50;
 const IMPASSABLE: u8 = u8::MAX;
 
