@@ -47,35 +47,6 @@ fn room_linear_distance(from: RoomName, to: RoomName) -> u32 {
     (((ax - bx).abs() / 50).max((ay - by).abs() / 50)) as u32
 }
 
-/// Project `pos` into `room`: its world position clamped to `room`'s 0..=49 tile bounds. For a
-/// cross-room `pos` this is the edge tile of `room` pointing toward it (the headless MoveToRoom
-/// projection — route to this exit, then the boundary cross carries you on). Same-room → unchanged.
-pub fn project_into_room(pos: Position, room: RoomName) -> Position {
-    if pos.room_name() == room {
-        return pos;
-    }
-    let c = RoomCoordinate::new(25).expect("25");
-    let (cx, cy) = Position::new(c, c, room).world_coords();
-    let (origin_x, origin_y) = (cx - 25, cy - 25); // room's (0,0) world coord
-    let (wx, wy) = pos.world_coords();
-    let lx = (wx - origin_x).clamp(0, 49) as u8;
-    let ly = (wy - origin_y).clamp(0, 49) as u8;
-    Position::new(RoomCoordinate::new(lx).expect("clamped"), RoomCoordinate::new(ly).expect("clamped"), room)
-}
-
-/// The unit room-step `(dx, dy)` from `from` to an orthogonally-adjacent `to` (east → `(1,0)`,
-/// north → `(0,-1)`, …); `(0,0)` if not orthogonally adjacent.
-pub fn room_step_direction(from: RoomName, to: RoomName) -> (i32, i32) {
-    let c = RoomCoordinate::new(25).expect("25");
-    let (ax, ay) = Position::new(c, c, from).world_coords();
-    let (bx, by) = Position::new(c, c, to).world_coords();
-    let (dx, dy) = ((bx - ax) / 50, (by - ay) / 50);
-    if dx.abs() + dy.abs() == 1 {
-        (dx, dy)
-    } else {
-        (0, 0)
-    }
-}
 
 const DIM: usize = 50;
 const IMPASSABLE: u8 = u8::MAX;
@@ -198,6 +169,22 @@ fn enter_cost(grid: &Grid, x: usize, y: usize, plain_cost: u8) -> Option<u32> {
         0 => Some(plain_cost.max(1) as u32),
         c => Some(c as u32),
     }
+}
+
+/// Rebuild the forward path (origin-exclusive) from a `Position`-keyed came-from map — the multi-room
+/// analogue of [`reconstruct`], so a path can span rooms.
+fn reconstruct_pos(came: &HashMap<Position, Position>, origin: Position, node: Position) -> Vec<Position> {
+    let mut path = Vec::new();
+    let mut cur = node;
+    while cur != origin {
+        path.push(cur);
+        match came.get(&cur) {
+            Some(&prev) => cur = prev,
+            None => break,
+        }
+    }
+    path.reverse();
+    path
 }
 
 /// Rebuild the forward path (origin-exclusive) from the came-from table.
@@ -414,20 +401,64 @@ impl PathfindingProvider for LocalPathfinder {
         plain_cost: u8,
         _swamp_cost: u8,
     ) -> PathfindingResult {
-        let room = origin.room_name();
-        if goal.room_name() != room {
-            return PathfindingResult { path: Vec::new(), incomplete: true };
+        // Multi-room A* over room-qualified `Position` nodes. Per-room cost grids are fetched lazily
+        // via `room_callback` (cached by `RoomName`); neighbours cross room boundaries (`checked_add`),
+        // and the admissible heuristic is `Position::get_range_to` (room-aware Chebyshev over world
+        // coords). This is the UNIFIED multi-room search — callers route cross-room with no MoveToRoom
+        // workaround (the old search rejected a cross-room goal outright). `incomplete` ⇒ best-effort
+        // toward the closest-reached tile. Single-room is the degenerate case (no border is crossed).
+        if origin.get_range_to(goal) <= range {
+            return PathfindingResult { path: Vec::new(), incomplete: false };
         }
-        let grid = match room_callback(room) {
-            Some(cm) => snapshot(&cm, room),
-            None => return PathfindingResult { path: Vec::new(), incomplete: true },
-        };
-        let (gx, gy) = (goal.x().u8() as i32, goal.y().u8() as i32);
-        let satisfied = |x: i32, y: i32| cheby(x, y, gx, gy) <= range;
-        let score = |x: i32, y: i32, _g: u32| cheby(x, y, gx, gy) as i64; // minimize distance to goal
-        let (path, incomplete) =
-            Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, false, satisfied, score);
-        PathfindingResult { path, incomplete }
+        let mut grids: HashMap<RoomName, Option<Box<Grid>>> = HashMap::new();
+        let mut g: HashMap<Position, u32> = HashMap::new();
+        let mut came: HashMap<Position, Position> = HashMap::new();
+        let mut heap: BinaryHeap<Reverse<(u32, u32, Position)>> = BinaryHeap::new();
+        g.insert(origin, 0);
+        heap.push(Reverse((origin.get_range_to(goal), 0, origin)));
+        let mut best = (origin.get_range_to(goal), origin);
+        let mut ops = 0u32;
+        while let Some(Reverse((_pri, gc, pos))) = heap.pop() {
+            if gc > *g.get(&pos).unwrap_or(&u32::MAX) {
+                continue; // stale heap entry
+            }
+            if pos.get_range_to(goal) <= range {
+                return PathfindingResult { path: reconstruct_pos(&came, origin, pos), incomplete: false };
+            }
+            let h = pos.get_range_to(goal);
+            if h < best.0 {
+                best = (h, pos);
+            }
+            ops += 1;
+            if ops >= max_ops {
+                return PathfindingResult { path: reconstruct_pos(&came, origin, best.1), incomplete: true };
+            }
+            for (dx, dy) in NEIGHBORS {
+                let np = match pos.checked_add((dx, dy)) {
+                    Ok(p) => p,
+                    Err(_) => continue, // off the world map
+                };
+                let np_room = np.room_name();
+                let grid = grids
+                    .entry(np_room)
+                    .or_insert_with(|| room_callback(np_room).map(|cm| snapshot(&cm, np_room)));
+                let Some(grid) = grid.as_ref() else {
+                    continue; // a room with no cost matrix is impassable
+                };
+                let step = match grid[np.x().u8() as usize][np.y().u8() as usize] {
+                    IMPASSABLE => continue,
+                    0 => plain_cost.max(1) as u32,
+                    c => c as u32,
+                };
+                let ng = gc.saturating_add(step);
+                if ng < *g.get(&np).unwrap_or(&u32::MAX) {
+                    g.insert(np, ng);
+                    came.insert(np, pos);
+                    heap.push(Reverse((ng.saturating_add(np.get_range_to(goal)), ng, np)));
+                }
+            }
+        }
+        PathfindingResult { path: reconstruct_pos(&came, origin, best.1), incomplete: true }
     }
 
     fn search_many(

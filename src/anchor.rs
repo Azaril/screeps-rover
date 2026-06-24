@@ -16,7 +16,7 @@
 //! matrix; the combat sim supplies `LocalPathfinder` + a `CombatWorld` cost source. One mechanism,
 //! both worlds. Serializable so it can live on the bot's persisted squad state.
 
-use crate::local_pathfinder::{moving_maximum, project_into_room, room_step_direction};
+use crate::local_pathfinder::moving_maximum;
 use crate::traits::*;
 use screeps::local::*;
 use serde::{Deserialize, Serialize};
@@ -150,70 +150,16 @@ impl AnchorPath {
         room_callback: &mut dyn FnMut(RoomName) -> Option<LocalCostMatrix>,
     ) {
         // Footprint-transform the cost matrix for EVERY room the search explores, so the W×H box
-        // routes as a unit (the prior code supplied a matrix only for the start room, starving the
-        // search). The headless `search` itself is single-room, so multi-room routing is the
-        // MoveToRoom layer: `find_route` gives the room sequence, we search to the EXIT toward the
-        // next room (the box's footprint included), then append the boundary-cross step so the cached
-        // path crosses as a unit. Same find_route contract live uses → unified multi-room movement.
+        // routes as a unit ACROSS room boundaries. The rover search is now multi-room, so a cross-room
+        // destination routes natively — no MoveToRoom layer, no per-room exit projection.
         let mut inner = |r: RoomName| room_callback(r).map(|base| moving_maximum(&base, footprint.0, footprint.1));
-
-        let cur_room = self.virtual_pos.room_name();
-        let dest_room = self.destination.room_name();
-        // (in-room goal to search to, optional boundary-cross step appended after it).
-        let (goal, cross_step) = if cur_room == dest_room {
-            (self.destination, None)
-        } else {
-            let next = pathfinder
-                .find_route(cur_room, dest_room, &|_to, _from| 1.0)
-                .ok()
-                .and_then(|route| route.get(1).map(|s| s.room));
-            match next {
-                Some(next_room) => {
-                    let dir = room_step_direction(cur_room, next_room);
-                    // The exit tile: project the destination into this room, then snap to the edge
-                    // shared with the next room (so we head for the right border tile).
-                    let proj = project_into_room(self.destination, cur_room);
-                    let (px, py) = (proj.x().u8(), proj.y().u8());
-                    let (gx, gy) = match dir {
-                        (1, 0) => (49, py),
-                        (-1, 0) => (0, py),
-                        (0, 1) => (px, 49),
-                        (0, -1) => (px, 0),
-                        _ => (px, py),
-                    };
-                    let goal = Position::new(
-                        RoomCoordinate::new(gx).expect("0..=49"),
-                        RoomCoordinate::new(gy).expect("0..=49"),
-                        cur_room,
-                    );
-                    (goal, goal.checked_add(dir).ok())
-                }
-                // No route (a room the matrix doesn't model / unreachable): head for the projected edge.
-                None => (project_into_room(self.destination, cur_room), None),
-            }
-        };
-
-        let result = pathfinder.search(self.virtual_pos, goal, 0, &mut inner, MAX_OPS, 2, 10);
-        // Cache only a COMPLETE path (an `incomplete` partial ends at an obstacle — following it would
-        // walk the box into the wall). On a cross-room hop, append the boundary-cross step so the
-        // anchor steps into the next room, then re-paths there.
+        let result = pathfinder.search(self.virtual_pos, self.destination, 0, &mut inner, MAX_OPS, 2, 10);
+        // Cache only a COMPLETE path. An `incomplete` partial ends at an obstacle (following it would
+        // walk the box into the wall, the exact failure we refuse) → treat as no path → caller Blocked.
         if result.incomplete || result.path.is_empty() {
-            // Already AT the exit edge (search empty) → just cross, if there's a cross step.
-            if self.virtual_pos == goal {
-                if let Some(cross) = cross_step {
-                    self.cached = vec![cross];
-                    self.index = 0;
-                    self.stuck_ticks = 0;
-                    return;
-                }
-            }
             self.invalidate();
         } else {
-            let mut path = result.path; // origin-exclusive steps
-            if let Some(cross) = cross_step {
-                path.push(cross);
-            }
-            self.cached = path;
+            self.cached = result.path; // origin-exclusive steps (may span rooms)
             self.index = 0;
             self.stuck_ticks = 0;
         }
