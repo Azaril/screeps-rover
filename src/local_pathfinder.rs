@@ -17,7 +17,35 @@
 use crate::traits::*;
 use screeps::local::*;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
+
+/// The orthogonal room neighbours of `room`, computed by stepping one tile across each edge
+/// (`checked_add` resolves the adjacent room and errors at the world's edge, which is skipped). The
+/// headless analogue of `Game.map.describeExits` — no game runtime needed.
+fn room_neighbors(room: RoomName) -> Vec<RoomName> {
+    let c = |v: u8| RoomCoordinate::new(v).expect("0..=49");
+    [
+        (c(49), c(25), (1i32, 0i32)),  // east
+        (c(0), c(25), (-1, 0)),        // west
+        (c(25), c(0), (0, -1)),        // north
+        (c(25), c(49), (0, 1)),        // south
+    ]
+    .iter()
+    .filter_map(|&(x, y, off)| Position::new(x, y, room).checked_add(off).ok().map(|p| p.room_name()))
+    .collect()
+}
+
+/// Chebyshev distance between two rooms (room-coordinate grid), via the world coords of each room's
+/// centre tile — the headless analogue of `Game.map.getRoomLinearDistance`.
+fn room_linear_distance(from: RoomName, to: RoomName) -> u32 {
+    let center = |r: RoomName| {
+        let c = RoomCoordinate::new(25).expect("25");
+        Position::new(c, c, r).world_coords()
+    };
+    let (ax, ay) = center(from);
+    let (bx, by) = center(to);
+    (((ax - bx).abs() / 50).max((ay - by).abs() / 50)) as u32
+}
 
 const DIM: usize = 50;
 const IMPASSABLE: u8 = u8::MAX;
@@ -410,22 +438,65 @@ impl PathfindingProvider for LocalPathfinder {
         PathfindingResult { path, incomplete }
     }
 
+    /// Room-level route via a weighted Dijkstra over the room graph — the headless analogue of
+    /// `Game.map.find_route`, so the sim routes multi-room through the SAME contract as the live
+    /// `ScreepsPathfinder` (unified multi-room movement). `room_callback(to_room, from_room)` is the
+    /// cost to ENTER `to_room` (matching the live arg order); a non-finite or negative cost marks the
+    /// room impassable (a detour is taken). Bounded to `MAX_ROUTE_ROOMS` settled rooms.
     fn find_route(
         &self,
         from: RoomName,
-        _to: RoomName,
-        _room_callback: &dyn Fn(RoomName, RoomName) -> f64,
+        to: RoomName,
+        room_callback: &dyn Fn(RoomName, RoomName) -> f64,
     ) -> Result<Vec<RouteStep>, String> {
-        // Single-room sim: the trivial route. (Multi-room is out of the combat-sim scope.)
-        Ok(vec![RouteStep { room: from }])
+        if from == to {
+            return Ok(vec![RouteStep { room: from }]);
+        }
+        const MAX_ROUTE_ROOMS: usize = 64;
+        // Costs quantised to u64 (×1000, min 1) so a min-heap can order them (f64 isn't Ord).
+        let mut best: HashMap<RoomName, u64> = HashMap::new();
+        let mut prev: HashMap<RoomName, RoomName> = HashMap::new();
+        let mut heap: BinaryHeap<Reverse<(u64, RoomName)>> = BinaryHeap::new();
+        best.insert(from, 0);
+        heap.push(Reverse((0, from)));
+        let mut settled = 0usize;
+        while let Some(Reverse((cost, room))) = heap.pop() {
+            if cost > *best.get(&room).unwrap_or(&u64::MAX) {
+                continue; // stale heap entry
+            }
+            if room == to {
+                let mut chain = vec![to];
+                let mut cur = to;
+                while let Some(&p) = prev.get(&cur) {
+                    chain.push(p);
+                    cur = p;
+                }
+                chain.reverse();
+                return Ok(chain.into_iter().map(|room| RouteStep { room }).collect());
+            }
+            settled += 1;
+            if settled > MAX_ROUTE_ROOMS {
+                break;
+            }
+            for nb in room_neighbors(room) {
+                let edge = room_callback(nb, room); // (to, from), live arg order
+                if !edge.is_finite() || edge < 0.0 {
+                    continue; // impassable room
+                }
+                let step = ((edge * 1000.0) as u64).max(1);
+                let ncost = cost.saturating_add(step);
+                if ncost < *best.get(&nb).unwrap_or(&u64::MAX) {
+                    best.insert(nb, ncost);
+                    prev.insert(nb, room);
+                    heap.push(Reverse((ncost, nb)));
+                }
+            }
+        }
+        Err(format!("no route from {} to {}", from, to))
     }
 
     fn get_room_linear_distance(&self, from: RoomName, to: RoomName) -> u32 {
-        if from == to {
-            0
-        } else {
-            1
-        }
+        room_linear_distance(from, to)
     }
 
     fn is_tile_walkable(&self, _pos: Position) -> bool {
@@ -490,7 +561,7 @@ mod tests {
         // A wall column at x=8 spanning y=3..=7, with the goal behind it. The path must route
         // around (through y<3 or y>7), never through the wall.
         let mut pf = LocalPathfinder;
-        let mut cb = || {
+        let cb = || {
             let mut cm = empty_cm();
             for y in 3..=7 {
                 block(&mut cm, 8, y);
@@ -692,5 +763,42 @@ mod tests {
         let src = ReachSource { pos: to_pos(25, 25, other), step_ticks: 1 };
         let r = pf.reachability_from(&[src], room(), &mut cb, 5000);
         assert_eq!(r.ticks_to_reach(pos(25, 25)), None, "an off-room source seeds no wave in this room");
+    }
+
+    // ── Multi-room routing (P-MOVE): find_route + linear distance ─────────────────────────────────
+
+    #[test]
+    fn find_route_crosses_two_rooms_east() {
+        let pf = LocalPathfinder;
+        let from: RoomName = "W1N1".parse().unwrap();
+        let to: RoomName = "E0N1".parse().unwrap(); // two rooms east: W1 → W0 → E0
+        let route = pf.find_route(from, to, &|_to, _from| 1.0).expect("a route exists");
+        assert_eq!(route.first().map(|s| s.room), Some(from), "starts at the origin room");
+        assert_eq!(route.last().map(|s| s.room), Some(to), "ends at the destination room");
+        assert_eq!(route.len(), 3, "shortest east route is W1N1 → W0N1 → E0N1");
+    }
+
+    #[test]
+    fn find_route_detours_around_a_blocked_room() {
+        // Block the direct east neighbour (W0N1); the route must detour around it (longer than 3).
+        let pf = LocalPathfinder;
+        let from: RoomName = "W1N1".parse().unwrap();
+        let to: RoomName = "E0N1".parse().unwrap();
+        let blocked: RoomName = "W0N1".parse().unwrap();
+        let route = pf
+            .find_route(from, to, &|to_room, _from| if to_room == blocked { f64::INFINITY } else { 1.0 })
+            .expect("a detour exists");
+        assert!(!route.iter().any(|s| s.room == blocked), "the blocked room is avoided");
+        assert!(route.len() > 3, "the detour is longer than the direct 3-room route (was {})", route.len());
+    }
+
+    #[test]
+    fn room_linear_distance_is_chebyshev() {
+        let pf = LocalPathfinder;
+        let a: RoomName = "W1N1".parse().unwrap();
+        assert_eq!(pf.get_room_linear_distance(a, a), 0);
+        assert_eq!(pf.get_room_linear_distance(a, "E0N1".parse().unwrap()), 2, "two rooms east");
+        assert_eq!(pf.get_room_linear_distance(a, "W1N3".parse().unwrap()), 2, "two rooms north");
+        assert_eq!(pf.get_room_linear_distance(a, "E0N3".parse().unwrap()), 2, "diagonal → Chebyshev max");
     }
 }
