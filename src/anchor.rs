@@ -140,10 +140,14 @@ impl AnchorPath {
         pathfinder: &mut dyn PathfindingProvider,
         room_callback: &mut dyn FnMut(RoomName) -> Option<LocalCostMatrix>,
     ) {
-        let room = self.virtual_pos.room_name();
-        // Footprint-transform the base matrix so the W×H box routes as a unit.
-        let transformed = room_callback(room).map(|base| moving_maximum(&base, footprint.0, footprint.1));
-        let mut inner = |r: RoomName| if r == room { transformed.clone() } else { None };
+        // Footprint-transform the cost matrix for EVERY room the search explores, so the W×H box
+        // routes as a unit ACROSS room boundaries — not just within the start room. The prior code
+        // supplied a matrix only for `virtual_pos`'s room (`None` for every other room), which starved
+        // the multi-room search: it picked exits geometrically / returned an incomplete path, so the
+        // anchor diverged from the squad members (which route multi-room via the rover MovementSystem's
+        // `find_route`), scattering the squad into the wrong rooms. Now the anchor consumes the same
+        // per-room matrices the caller already builds, so it crosses the correct exits.
+        let mut inner = |r: RoomName| room_callback(r).map(|base| moving_maximum(&base, footprint.0, footprint.1));
         let result = pathfinder.search(self.virtual_pos, self.destination, 0, &mut inner, MAX_OPS, 2, 10);
         // Cache only a COMPLETE path. An `incomplete` result is a best-effort partial toward an
         // unreachable goal (it ends at the obstacle) — following it would walk the box into the
