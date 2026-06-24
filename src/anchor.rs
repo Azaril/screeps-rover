@@ -129,6 +129,15 @@ impl AnchorPath {
         AnchorOutcome::Blocked
     }
 
+    /// True if the anchor's NEXT cached step crosses into a different room. The caller (a squad)
+    /// pre-groups its members at the exit before taking this step, then crosses as a bloc — so they
+    /// aren't strung out across the border and picked off one-by-one (cross-edge cohesion, P-MOVE).
+    pub fn next_step_crosses_room(&self) -> bool {
+        self.cached
+            .get(self.index)
+            .is_some_and(|next| next.room_name() != self.virtual_pos.room_name())
+    }
+
     fn invalidate(&mut self) {
         self.cached.clear();
         self.index = 0;
