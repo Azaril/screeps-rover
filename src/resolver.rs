@@ -408,6 +408,15 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
                 ca.priority
                     .cmp(&cb.priority)
                     .then_with(|| ca.stuck_ticks.cmp(&cb.stuck_ticks))
+                    // Final tie-break on the Handle so the contested-tile winner
+                    // is a pure function of (priority, stuck_ticks, Handle) and
+                    // NOT of std HashMap's per-process iteration order. Without
+                    // this, two equal-priority/equal-stuck creeps contending for
+                    // the same tile have the winner decided by `candidates` Vec
+                    // order, which is the HashMap-seed order they were pushed in
+                    // (see `creeps.iter()` above) -> seed-flaky resolved moves.
+                    // Higher Handle wins (convention; documented).
+                    .then_with(|| ca.entity.cmp(&cb.entity))
             })
             .copied();
 
@@ -477,11 +486,17 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
         // Losers: other candidates that wanted this same tile but lost the
         // priority contest. Try local avoidance for each so they can side-step
         // instead of wasting a tick standing still.
-        let losers: Vec<Handle> = candidates
+        let mut losers: Vec<Handle> = candidates
             .iter()
             .filter(|h| **h != winner_handle && !creeps[*h].resolved)
             .copied()
             .collect();
+        // Sort losers deterministically: each loser's avoidance is resolved
+        // against a `firmly_occupied` set rebuilt after every prior loser, so
+        // with >=2 losers the tile a later loser can claim depends on the
+        // iteration order. `candidates` order is HashMap-seeded, so sort by
+        // Handle to make the avoidance assignment seed-independent.
+        losers.sort();
 
         for loser_handle in losers {
             let loser_creep = &creeps[&loser_handle];
@@ -910,5 +925,66 @@ mod tests {
             &nothing_walkable,
         );
         assert_eq!(result, None);
+    }
+
+    fn mover(entity: u32, at: Position, desired: Position) -> ResolvedCreep<u32> {
+        ResolvedCreep {
+            entity,
+            current_pos: at,
+            desired_pos: Some(desired),
+            // Both contenders carry the DEFAULT priority and zero stuck_ticks,
+            // so (priority, stuck_ticks) is a full tie and only the Handle
+            // tie-break decides the winner.
+            priority: MovementPriority::Normal,
+            allow_shove: true,
+            allow_swap: true,
+            stuck_ticks: 0,
+            resolved: false,
+            final_pos: at,
+            has_request: true,
+            anchor: None,
+        }
+    }
+
+    // Regression for the seed-flaky kiting flake: when two equal-priority,
+    // equal-stuck creeps contend for the SAME desired tile, the winner must be
+    // a deterministic function of (priority, stuck_ticks, Handle) and NOT of
+    // the std HashMap per-process iteration order. Before the Handle tie-break,
+    // `max_by` returned `candidates.last()` (HashMap-seed order), so which
+    // creep advanced flipped per process. We assert the winner is identical
+    // regardless of insertion order (the only lever we control on a per-process
+    // fixed-seed HashMap) and that it is the higher Handle (documented convention).
+    #[test]
+    fn contested_tile_winner_is_handle_deterministic_not_seed_dependent() {
+        let a = pos(20, 25);
+        let b = pos(20, 26);
+        let contested = pos(20, 24); // both want to advance into this tile
+
+        let run = |insert_high_first: bool| -> (Position, Position) {
+            let mut creeps: HashMap<u32, ResolvedCreep<u32>> = HashMap::new();
+            if insert_high_first {
+                creeps.insert(2, mover(2, b, contested));
+                creeps.insert(1, mover(1, a, contested));
+            } else {
+                creeps.insert(1, mover(1, a, contested));
+                creeps.insert(2, mover(2, b, contested));
+            }
+            // Open field: everything walkable, no idle creeps.
+            let walkable = |_: Position| -> bool { true };
+            resolve_conflicts(&mut creeps, &HashMap::new(), &walkable, DEFAULT_MAX_SHOVE_DEPTH);
+            (creeps[&1].final_pos, creeps[&2].final_pos)
+        };
+
+        let (a1_lo, a2_lo) = run(false);
+        let (a1_hi, a2_hi) = run(true);
+
+        // Insertion order must not change the resolved positions.
+        assert_eq!(a1_lo, a1_hi, "creep 1 resolved pos must be insertion-order-independent");
+        assert_eq!(a2_lo, a2_hi, "creep 2 resolved pos must be insertion-order-independent");
+
+        // Higher Handle (creep 2) wins the contested tile; the loser side-steps
+        // (local avoidance) and does NOT take the contested tile.
+        assert_eq!(a2_lo, contested, "higher Handle must win the contested tile");
+        assert_ne!(a1_lo, contested, "lower Handle must not also occupy the contested tile");
     }
 }
