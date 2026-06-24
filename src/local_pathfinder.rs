@@ -71,6 +71,17 @@ type CameFrom = [[Option<(u8, u8)>; DIM]; DIM];
 /// A headless [`PathfindingProvider`] (see module docs). Zero-sized; construct with `LocalPathfinder`.
 pub struct LocalPathfinder;
 
+/// One settled tile from [`LocalPathfinder::search_scored_set`]: its position, the flood's path-cost
+/// `g` from the origin (= wall-aware distance-from-centroid, the cohesion input), and its `score` under
+/// the caller's cost fn. A scored snapshot of the reachable neighbourhood the squad-layout planner
+/// assigns members across.
+#[derive(Clone, Copy, Debug)]
+pub struct ScoredTile {
+    pub pos: Position,
+    pub g: u32,
+    pub score: i64,
+}
+
 /// A source for the multi-source reachability flood ([`LocalPathfinder::reachability_from`], ADR 0019
 /// §2.2): a creep's position + its fatigue **cadence** — how many ticks it spends to step one tile
 /// (`>=1`; lower = faster, so its wave spreads sooner). The caller derives `step_ticks` from the
@@ -219,6 +230,11 @@ impl LocalPathfinder {
         dijkstra: bool,
         satisfied: S,
         score: B,
+        // Called once per SETTLED tile (popped, non-stale, not satisfied) with `(x, y, g, score)` — the
+        // hook the scored-SET search ([`search_scored_set`]) uses to collect the whole flood without
+        // forking the traversal (so it stays byte-identical to [`search_scored`]). All distance-search
+        // callers pass a no-op.
+        on_settle: &mut dyn FnMut(u8, u8, u32, i64),
     ) -> (Vec<Position>, bool)
     where
         S: Fn(i32, i32) -> bool,
@@ -248,6 +264,7 @@ impl LocalPathfinder {
                 return (reconstruct(&came, origin, (x, y), room), false);
             }
             let s = score(x as i32, y as i32, gc);
+            on_settle(x, y, gc, s);
             if s < best.0 {
                 best = (s, x, y);
             }
@@ -307,8 +324,36 @@ impl LocalPathfinder {
         let satisfied = |_x: i32, _y: i32| false;
         let score = |x: i32, y: i32, g: u32| cost(to_pos(x as u8, y as u8, room), g);
         let (path, incomplete) =
-            Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, true, satisfied, score);
+            Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, true, satisfied, score, &mut |_x, _y, _g, _s| {});
         PathfindingResult { path, incomplete }
+    }
+
+    /// Bounded **scored-SET** single-room search: the SAME one bounded Dijkstra flood as
+    /// [`search_scored`], but returns EVERY settled tile as a [`ScoredTile`] `(pos, g, score)` instead of
+    /// only the path to the single minimum. The squad-layout planner (combat) prices the whole reachable
+    /// neighbourhood once and assigns DISTINCT per-member tiles from it (one flood, not N) — members then
+    /// path to their assigned tile through their own move resolution, so no per-tile path is returned.
+    /// Byte-identical traversal to `search_scored` (shared `run`, same heap/tie-breaks): the min-`score`
+    /// tile here equals `search_scored`'s chosen goal.
+    pub fn search_scored_set(
+        &self,
+        origin: Position,
+        room_callback: &mut dyn FnMut(RoomName) -> Option<LocalCostMatrix>,
+        max_ops: u32,
+        plain_cost: u8,
+        cost: &dyn Fn(Position, u32) -> i64,
+    ) -> Vec<ScoredTile> {
+        let room = origin.room_name();
+        let grid = match room_callback(room) {
+            Some(cm) => snapshot(&cm, room),
+            None => return Vec::new(),
+        };
+        let satisfied = |_x: i32, _y: i32| false;
+        let score = |x: i32, y: i32, g: u32| cost(to_pos(x as u8, y as u8, room), g);
+        let mut tiles: Vec<ScoredTile> = Vec::new();
+        let mut collect = |x: u8, y: u8, g: u32, s: i64| tiles.push(ScoredTile { pos: to_pos(x, y, room), g, score: s });
+        let _ = Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, true, satisfied, score, &mut collect);
+        tiles
     }
 
     /// **Multi-source weighted Dijkstra** (ADR 0019 §2.2 — the operator's flood-fill): for every tile,
@@ -489,12 +534,12 @@ impl PathfindingProvider for LocalPathfinder {
             // Goal: outside EVERY flee range. Best-effort: maximize the min distance (score negated).
             let satisfied = |x: i32, y: i32| local.iter().all(|(gx, gy, r)| cheby(x, y, *gx, *gy) > *r);
             let score = |x: i32, y: i32, _g: u32| -(min_dist(x, y) as i64);
-            Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, false, satisfied, score)
+            Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, false, satisfied, score, &mut |_x, _y, _g, _s| {})
         } else {
             // Goal: within ANY goal's range. Best-effort: minimize the min distance.
             let satisfied = |x: i32, y: i32| local.iter().any(|(gx, gy, r)| cheby(x, y, *gx, *gy) <= *r);
             let score = |x: i32, y: i32, _g: u32| min_dist(x, y) as i64;
-            Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, false, satisfied, score)
+            Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, false, satisfied, score, &mut |_x, _y, _g, _s| {})
         };
         PathfindingResult { path, incomplete }
     }
@@ -710,6 +755,38 @@ mod tests {
         let r = pf.search_scored(pos(25, 25), &mut cb, 5000, 1, &cost);
         assert!(!r.path.is_empty(), "moves toward the min-cost tile");
         assert_eq!(*r.path.last().unwrap(), goal, "ends at the min-cost (zero) tile");
+    }
+
+    #[test]
+    fn search_scored_set_min_tile_equals_search_scored_goal() {
+        // The scored-SET search shares `run` with `search_scored`, so the min-`score` tile in the set is
+        // exactly the goal `search_scored` returns — and the set covers the whole flooded neighbourhood.
+        let pf = LocalPathfinder;
+        let mut cb = |_r| Some(empty_cm());
+        let goal = pos(30, 25);
+        let cost = |p: Position, _g: u32| p.get_range_to(goal) as i64;
+        let single = pf.search_scored(pos(25, 25), &mut cb, 5000, 1, &cost);
+        let set = pf.search_scored_set(pos(25, 25), &mut cb, 5000, 1, &cost);
+        assert!(!set.is_empty(), "the set captures settled tiles");
+        let min = set.iter().min_by_key(|t| (t.score, t.pos.x().u8(), t.pos.y().u8())).unwrap();
+        assert_eq!(min.pos, *single.path.last().unwrap(), "set's min-score tile == search_scored's goal");
+        assert_eq!(min.pos, goal, "and it's the global-min (zero-cost) tile");
+        // `g` is the path-cost from the origin (cohesion distance): the origin itself settles at g=0.
+        assert!(set.iter().any(|t| t.pos == pos(25, 25) && t.g == 0), "origin settled at g=0");
+        // Every settled tile's score matches re-pricing it (determinism + the g passed through).
+        assert!(set.iter().all(|t| t.score == cost(t.pos, t.g)), "scores are the cost fn over (pos,g)");
+    }
+
+    #[test]
+    fn search_scored_set_is_deterministic() {
+        let pf = LocalPathfinder;
+        let mut cb = |_r| Some(empty_cm());
+        let goal = pos(12, 40);
+        let cost = |p: Position, g: u32| p.get_range_to(goal) as i64 + g as i64;
+        let a = pf.search_scored_set(pos(25, 25), &mut cb, 800, 1, &cost);
+        let b = pf.search_scored_set(pos(25, 25), &mut cb, 800, 1, &cost);
+        let key = |s: &Vec<ScoredTile>| s.iter().map(|t| (t.pos.x().u8(), t.pos.y().u8(), t.g, t.score)).collect::<Vec<_>>();
+        assert_eq!(key(&a), key(&b), "same inputs → identical settled set (order + values)");
     }
 
     #[test]
