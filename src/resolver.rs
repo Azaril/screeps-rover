@@ -125,7 +125,7 @@ pub(crate) struct ResolvedCreep<Handle: Hash + Eq + Copy> {
 
 /// Topologically sorts entities based on follow dependencies.
 /// Returns (sorted order, set of entities whose follow was broken into MoveTo).
-pub(crate) fn topological_sort_follows<Handle: Hash + Eq + Copy>(
+pub(crate) fn topological_sort_follows<Handle: Hash + Eq + Copy + Ord>(
     requests: &HashMap<Handle, MovementRequest<Handle>>,
 ) -> (Vec<Handle>, HashMap<Handle, Handle>) {
     // Build adjacency: follower -> leader
@@ -142,7 +142,10 @@ pub(crate) fn topological_sort_follows<Handle: Hash + Eq + Copy>(
     let mut broken_follows: HashMap<Handle, Handle> = HashMap::new();
     let mut visited: HashMap<Handle, bool> = HashMap::new(); // true = fully processed, false = in current path
 
-    for start in follow_edges.keys().copied().collect::<Vec<_>>() {
+    // Sorted: the cycle-break order (which follow edge is severed) must be seed-independent.
+    let mut starts: Vec<Handle> = follow_edges.keys().copied().collect();
+    starts.sort_unstable();
+    for start in starts {
         if visited.contains_key(&start) {
             continue;
         }
@@ -217,16 +220,23 @@ pub(crate) fn topological_sort_follows<Handle: Hash + Eq + Copy>(
         }
 
         if batch.is_empty() {
-            // Remaining unprocessed entities (shouldn't happen if cycles are broken).
-            for (entity, _) in remaining.iter() {
-                if !processed.contains(entity) {
-                    sorted.push(*entity);
-                    processed.insert(*entity);
-                }
+            // Remaining unprocessed entities (shouldn't happen if cycles are broken). Sort by Handle so
+            // the fallback order is seed-independent (else `remaining.iter()` is HashMap-seed order).
+            let mut leftover: Vec<Handle> = remaining.keys().copied().filter(|e| !processed.contains(e)).collect();
+            leftover.sort_unstable();
+            for entity in leftover {
+                sorted.push(entity);
+                processed.insert(entity);
             }
             break;
         }
 
+        // DETERMINISM: `batch` was built by iterating `remaining` (a HashMap) in per-process-seed order.
+        // The resulting `sorted` order drives Pass-1 path computation, which consumes the SHARED per-tick
+        // pathfinding-ops budget — so on expensive (dense-base) pathing, a seed-dependent order changes
+        // WHICH creeps get a full path before the budget binds → seed-flaky moves. Sort each topological
+        // level by Handle to make it deterministic (preserving the leaders-before-followers invariant).
+        batch.sort_unstable();
         for entity in &batch {
             sorted.push(*entity);
             processed.insert(*entity);
@@ -277,11 +287,23 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
     // Build current-position map: position -> entity for all unresolved creeps
     // in `resolved_creeps`. This lets us find ANY creep blocking a tile, whether
     // it is stationary (desired_pos == None) or also trying to move somewhere.
-    let current_pos_to_entity: HashMap<Position, Handle> = creeps
-        .iter()
-        .filter(|(_, c)| !c.resolved)
-        .map(|(entity, c)| (c.current_pos, *entity))
-        .collect();
+    //
+    // DETERMINISM: when two creeps occupy the SAME tile (a transient cross-room
+    // border stack is possible in the sim), a naive `.collect()` keeps whichever
+    // creep `creeps.iter()` (HashMap-seed order) yields LAST — so `find_occupant`
+    // (hence the shove target) is seed-flaky. Build in Handle-sorted order and
+    // keep the LOWEST Handle on collision so the occupant is a pure function of
+    // the world, not the per-process hash seed.
+    let current_pos_to_entity: HashMap<Position, Handle> = {
+        let mut ordered: Vec<(Handle, Position)> =
+            creeps.iter().filter(|(_, c)| !c.resolved).map(|(entity, c)| (*entity, c.current_pos)).collect();
+        ordered.sort_unstable_by_key(|(entity, _)| *entity);
+        let mut map: HashMap<Position, Handle> = HashMap::new();
+        for (entity, pos) in ordered {
+            map.entry(pos).or_insert(entity);
+        }
+        map
+    };
 
     // Find the creep currently occupying a tile. Checks resolved_creeps first
     // (covers moving, idle, and stationary creeps), then idle_creep_positions
@@ -549,14 +571,21 @@ fn resolve_swaps<Handle: Hash + Eq + Copy + Ord>(
 
     let mut swap_pairs: Vec<(Handle, Handle)> = Vec::new();
 
-    for (entity, creep) in creeps.iter() {
+    // Determinism: walk the creeps in a STABLE (Handle-sorted) order, not `HashMap` iteration order
+    // (which is per-process-seed-randomized). Swap discovery + the resulting `swap_pairs` order feed the
+    // execution below; a process-dependent order leaks into final positions → a divergent trajectory that
+    // accumulates over ticks. (See the determinism test in screeps-combat-eval.)
+    let mut discovery_order: Vec<Handle> = creeps.keys().copied().collect();
+    discovery_order.sort_unstable();
+    for entity in discovery_order {
+        let creep = &creeps[&entity];
         if creep.resolved || !creep.allow_swap {
             continue;
         }
         if let Some(desired) = creep.desired_pos {
             // Is there a creep at the desired position?
             if let Some(&other_entity) = pos_to_entity.get(&desired) {
-                if other_entity == *entity {
+                if other_entity == entity {
                     continue;
                 }
                 let other = &creeps[&other_entity];
@@ -566,10 +595,10 @@ fn resolve_swaps<Handle: Hash + Eq + Copy + Ord>(
                 // Does the other creep want our position?
                 if other.desired_pos == Some(creep.current_pos) {
                     // It's a swap! Record it (avoid duplicates).
-                    let pair = if *entity < other_entity {
-                        (*entity, other_entity)
+                    let pair = if entity < other_entity {
+                        (entity, other_entity)
                     } else {
-                        (other_entity, *entity)
+                        (other_entity, entity)
                     };
                     if !swap_pairs.contains(&pair) {
                         swap_pairs.push(pair);
