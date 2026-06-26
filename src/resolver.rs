@@ -288,12 +288,12 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
     // in `resolved_creeps`. This lets us find ANY creep blocking a tile, whether
     // it is stationary (desired_pos == None) or also trying to move somewhere.
     //
-    // DETERMINISM: when two creeps occupy the SAME tile (a transient cross-room
-    // border stack is possible in the sim), a naive `.collect()` keeps whichever
-    // creep `creeps.iter()` (HashMap-seed order) yields LAST — so `find_occupant`
-    // (hence the shove target) is seed-flaky. Build in Handle-sorted order and
-    // keep the LOWEST Handle on collision so the occupant is a pure function of
-    // the world, not the per-process hash seed.
+    // DETERMINISM (defence-in-depth): a valid world holds ≤1 creep per tile, so on the live bot this map
+    // never collides. But if a degenerate input ever stacks a tile (the sim once did, via a harness
+    // placement bug — now fixed), a naive `.collect()` keeps whichever creep `creeps.iter()` (HashMap-seed
+    // order) yields LAST → `find_occupant` (hence the shove target) is seed-flaky. Build in Handle-sorted
+    // order and keep the LOWEST Handle on collision so the occupant is a pure function of the world, not
+    // the per-process hash seed.
     let current_pos_to_entity: HashMap<Position, Handle> = {
         let mut ordered: Vec<(Handle, Position)> =
             creeps.iter().filter(|(_, c)| !c.resolved).map(|(entity, c)| (*entity, c.current_pos)).collect();
