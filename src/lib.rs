@@ -20,7 +20,7 @@ pub use costmatrix::*;
 pub use costmatrixsystem::*;
 pub use error::*;
 pub use anchor::{AnchorOutcome, AnchorPath};
-pub use gridsearch::{reaches_room_edge, room_grid_dijkstra};
+pub use gridsearch::{reaches_room_edge, room_grid_dijkstra, room_grid_dijkstra_to_edge};
 pub use local_pathfinder::{moving_maximum, LocalPathfinder, ReachSource, ReachabilityMap, ScoredTile};
 pub use location::*;
 pub use movementrequest::*;
