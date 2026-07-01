@@ -197,7 +197,7 @@ fn run_trace_full(
         let result = results.get(&1u32).cloned();
 
         let before = external.creep.pos;
-        let chosen = last_move.borrow().clone();
+        let chosen = *last_move.borrow();
 
         // Apply the move exactly as the game does: applying a Direction offset
         // to an exit-tile Position crosses the border to the mirror entrance

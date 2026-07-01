@@ -45,12 +45,15 @@ pub struct StuckThresholds {
     pub avoid_all_friendly_creeps: u16,
     /// Ticks immobile before increasing search max_ops (tier 2).
     pub increase_ops: u16,
-    /// Ticks immobile before enabling shoving in the resolver (tier 3).
-    /// NOTE: not currently consulted — nothing calls `should_enable_shoving*`; shoving is
-    /// governed per-request via `MovementRequest.allow_shove` plus the resolver's own
-    /// priority/stuck gate (`try_shove`'s `STUCK_SHOVE_THRESHOLD`). Wiring this tier (making
-    /// shove an ESCALATION instead of a per-request default) is a recorded follow-up; doing it
-    /// silently here would change live behavior, so the field stays documented-but-inert.
+    /// Ticks immobile before enabling shoving in the resolver (tier 3). Consulted ONLY when
+    /// [`MovementSystem::set_shove_escalation`]`(true)` opted in (default OFF preserves the
+    /// historical behavior exactly): with escalation ON, a creep may INITIATE shoves only once
+    /// `ticks_immobile` reaches this tier (`request.allow_shove` still required), and this value
+    /// replaces the resolver's historical `STUCK_SHOVE_THRESHOLD` constant as the stuck gate in
+    /// `try_shove` — tier 3 has ONE knob, per-request tunable via
+    /// `MovementRequest::stuck_thresholds`. With escalation OFF, shoving stays governed
+    /// per-request via `MovementRequest.allow_shove` plus the resolver's own priority/stuck gate
+    /// at the constant threshold (5).
     pub enable_shoving: u16,
     /// Ticks immobile before reporting failure to the job layer (tier 4).
     pub report_failure: u16,
@@ -84,6 +87,14 @@ pub struct StuckState {
     /// Distance to target last tick (for progress tracking).
     #[serde(default)]
     pub last_distance: u32,
+    /// Set by `process()` when the resolver denied this creep's grant because of an IDLE
+    /// occupant (avoidance sidestep, stay, or the sealed-corridor push) — consumed by the next
+    /// tick's path-progress accounting, which then records IMMOBILE even if the creep physically
+    /// moved (denial-as-stuck, ADR 0033 M5: the avoidance dance must feed the escalation
+    /// ladder). Additive `#[serde(default)]` field (the `last_distance` precedent) — old
+    /// serialized state deserializes with `false`.
+    #[serde(default)]
+    pub denied_by_idle: bool,
 }
 
 impl StuckState {
@@ -93,6 +104,7 @@ impl StuckState {
         self.ticks_no_progress = 0;
         self.repath_count = 0;
         self.last_distance = 0;
+        self.denied_by_idle = false;
     }
 
     /// Record that the creep moved this tick.
@@ -143,8 +155,8 @@ impl StuckState {
         self.ticks_immobile >= thresholds.increase_ops
     }
 
-    /// NOTE: currently unconsulted (no MovementSystem/resolver caller) — see
-    /// `StuckThresholds::enable_shoving`.
+    /// Tier 3: consulted by `process()` when shove-escalation mode is opted in — see
+    /// `StuckThresholds::enable_shoving`. (Inert under the default escalation-OFF mode.)
     pub fn should_enable_shoving_with(&self, thresholds: &StuckThresholds) -> bool {
         self.ticks_immobile >= thresholds.enable_shoving
     }
@@ -245,6 +257,13 @@ where
     pub fn request_count(&self) -> usize {
         self.requests.len()
     }
+
+    /// Whether `entity` has a movement request this tick. Used by callers building the
+    /// idle-occupant registration ([`MovementSystem::set_idle_creep_positions`]): every living
+    /// owned creep ABSENT from the request set is a known stationary occupant.
+    pub fn contains_request(&self, entity: &Handle) -> bool {
+        self.requests.contains_key(entity)
+    }
 }
 
 /// External interface that the movement system uses to interact with the
@@ -314,6 +333,12 @@ pub struct MovementSystem<'a, Handle> {
     /// escalation SPEED is tunable per deployment (and benchmarkable offline); defaults preserve
     /// the historical ladder exactly.
     stuck_thresholds: StuckThresholds,
+    /// Shove-as-ESCALATION opt-in (default OFF = the historical behavior: any winner may attempt
+    /// a shove and the resolver's constant `STUCK_SHOVE_THRESHOLD` gates equal/lower-priority
+    /// shovers). When ON: a creep may initiate shoves only when `request.allow_shove` AND its
+    /// stuck ladder reached tier 3 (`StuckThresholds::enable_shoving`), and that same tier value
+    /// replaces the resolver constant — ONE knob, per-request tunable.
+    shove_escalation: bool,
     /// CPU budget for stuck repathing. When exhausted, the movement system
     /// skips pathfinding for stuck creeps (they keep their existing path and
     /// the resolver's shove/swap mechanisms can still help). Only
@@ -384,6 +409,7 @@ where
             // (12 → 48 ticks) and is unvalidated for combat movement (immobility under fire), so
             // it stays a recorded candidate, not the default. See ADR 0033 §D5.4.
             stuck_thresholds: StuckThresholds::default(),
+            shove_escalation: false,
             cpu_budget: None,
             repath_budget: None,
             pathfinding_ops_budget_cap: DEFAULT_PATHFIND_OPS_BUDGET,
@@ -447,11 +473,27 @@ where
         self.friendly_creep_distance = distance;
     }
 
-    /// Set the stuck-escalation ladder (see [`StuckThresholds`]). Every stuck check the system
-    /// performs routes through this — tune it to trade wasted-intent burn (slow escalation)
-    /// against premature detours (fast escalation).
+    /// Set the SYSTEM-level stuck-escalation ladder (see [`StuckThresholds`]). Every stuck check
+    /// the system performs routes through this — tune it to trade wasted-intent burn (slow
+    /// escalation) against premature detours (fast escalation). A request carrying its own
+    /// `stuck_thresholds` overrides this per creep (the ADR 0033 split-defaults end-state).
     pub fn set_stuck_thresholds(&mut self, thresholds: StuckThresholds) {
         self.stuck_thresholds = thresholds;
+    }
+
+    /// The effective ladder for one request: request-override else system default (ADR 0033 M5
+    /// per-request `StuckThresholds` — haul jobs pass a slow ladder, military keeps the fast
+    /// default, in the SAME process() call). Every stuck consult must route through this.
+    fn thresholds_for<'r>(&'r self, request: &'r MovementRequest<Handle>) -> &'r StuckThresholds {
+        request.stuck_thresholds.as_ref().unwrap_or(&self.stuck_thresholds)
+    }
+
+    /// Opt into shove-as-ESCALATION (see the `shove_escalation` field doc). OFF (default)
+    /// preserves today's behavior EXACTLY — shove is a per-request default gated by the
+    /// resolver's constant; ON makes tier 3 (`StuckThresholds::enable_shoving`) the single knob
+    /// for when a stuck creep may start displacing others.
+    pub fn set_shove_escalation(&mut self, enabled: bool) {
+        self.shove_escalation = enabled;
     }
 
     /// Register creeps that are NOT in this tick's `MovementData` as stationary occupants
@@ -657,6 +699,21 @@ where
                         .map(|p| p.stuck_state.ticks_immobile as u32)
                         .unwrap_or(0);
 
+                    // Shove-escalation wiring (opt-in; see `set_shove_escalation`): with the mode
+                    // ON, this creep may INITIATE shoves only once its stuck ladder reached tier
+                    // 3, and its per-request `enable_shoving` becomes the resolver's stuck gate
+                    // (ONE knob). With the mode OFF both values reproduce today's behavior
+                    // exactly (always-attempt + the historical constant).
+                    let thresholds = self.thresholds_for(request);
+                    let shove_enabled = request.allow_shove
+                        && (!self.shove_escalation
+                            || stuck_ticks >= thresholds.enable_shoving as u32);
+                    let shove_stuck_threshold = if self.shove_escalation {
+                        thresholds.enable_shoving as u32
+                    } else {
+                        STUCK_SHOVE_THRESHOLD
+                    };
+
                     resolved_creeps.insert(
                         *entity,
                         ResolvedCreep {
@@ -664,12 +721,16 @@ where
                             current_pos: creep_pos,
                             desired_pos: Some(desired_pos),
                             priority: request.priority,
+                            priority_value: request.effective_priority(),
                             allow_shove: request.allow_shove,
+                            shove_enabled,
+                            shove_stuck_threshold,
                             allow_swap: request.allow_swap,
                             stuck_ticks,
                             resolved: false,
                             final_pos: creep_pos,
                             has_request: true,
+                            denied_by_idle: false,
                             anchor: request.anchor,
                         },
                     );
@@ -685,12 +746,18 @@ where
                                 current_pos: creep_pos,
                                 desired_pos: None,
                                 priority: request.priority,
+                                priority_value: request.effective_priority(),
                                 allow_shove: request.allow_shove,
+                                // An arrived creep never initiates a shove (no desired tile), so
+                                // the shover-side fields are inert; keep the OFF-mode constants.
+                                shove_enabled: false,
+                                shove_stuck_threshold: STUCK_SHOVE_THRESHOLD,
                                 allow_swap: request.allow_swap,
                                 stuck_ticks: 0,
                                 resolved: false,
                                 final_pos: creep_pos,
                                 has_request: true,
+                                denied_by_idle: false,
                                 anchor: request.anchor,
                             },
                         );
@@ -708,6 +775,41 @@ where
 
         // --- Pass 2: Conflict resolution ---
         if !self.is_over_tick_limit() && !self.is_over_movement_cap() {
+            // SHOVEABLE IDLES (ADR 0033 M5 follow-up #2): registered idle occupants get a
+            // synthesized `ResolvedCreep` entry (`has_request: false`, LOWEST movable priority
+            // anchor, shoveable) so `try_shove` can displace a corridor-mouth parker instead of
+            // it being undisplaceable by construction (no entry -> try_shove returned false).
+            // Their shove move surfaces through Pass 3 like any other resolved move. Entries are
+            // inserted in position-sorted order with `or_insert` semantics so a (degenerate)
+            // handle registered twice resolves to a pure function of the world, not HashMap
+            // iteration order.
+            let mut idle_entries: Vec<(Position, Handle)> = idle_creep_positions
+                .iter()
+                .map(|(pos, handle)| (*pos, *handle))
+                .collect();
+            idle_entries.sort_unstable_by_key(|(p, _)| (p.room_name(), p.x().u8(), p.y().u8()));
+            for (pos, entity) in idle_entries {
+                resolved_creeps.entry(entity).or_insert_with(|| ResolvedCreep {
+                    entity,
+                    current_pos: pos,
+                    desired_pos: None,
+                    priority: MovementPriority::Low,
+                    priority_value: MovementPriority::Low.anchor_value(),
+                    // A parked creep consents to displacement (any mover with a real
+                    // priority outranks the Low anchor); it never initiates shoves.
+                    allow_shove: true,
+                    shove_enabled: false,
+                    shove_stuck_threshold: STUCK_SHOVE_THRESHOLD,
+                    allow_swap: false,
+                    stuck_ticks: 0,
+                    resolved: false,
+                    final_pos: pos,
+                    has_request: false,
+                    denied_by_idle: false,
+                    anchor: None,
+                });
+            }
+
             // Blocking-structure layer for shove/local-avoidance (IBEX-040):
             // terrain alone lets the resolver shove a creep onto a tile
             // occupied by a blocking structure (wall, spawn, hostile rampart)
@@ -775,11 +877,54 @@ where
                 continue;
             }
 
+            // Synthesized idle occupants (no request this tick): the only way one surfaces is a
+            // SHOVE — its displacement move must be issued exactly like a requested mover's
+            // (both the offline driver and the live provider serve `get_creep` for any living
+            // creep). An undisturbed idle gets no result entry: it has no job-side request to
+            // answer, and running the stuck bookkeeping would fabricate cache state for it.
+            if !resolved.has_request {
+                if resolved.final_pos == resolved.current_pos {
+                    continue;
+                }
+                if let Ok(creep) = external.get_creep(*entity) {
+                    if let Some(dir) = resolved.current_pos.get_direction_to(resolved.final_pos) {
+                        if creep.move_direction(dir).is_ok() {
+                            results.insert(*entity, MovementResult::Moving);
+                            executed_one_move = true;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // DENIAL-AS-STUCK (ADR 0033 M5 follow-up #2): an idle-occupant denial counts as
+            // immobility EVEN IF the creep moved to an avoidance tile — mark the persisted stuck
+            // state so next tick's path-progress accounting records IMMOBILE instead of resetting
+            // the ladder (the sidestep DANCE must feed the escalation tiers; that is the whole
+            // fix for the zero-failed-intent dance livelock). Stay-in-place denials also record
+            // immobility below as before; the flag is what catches the *moved* case.
+            if resolved.denied_by_idle {
+                if let Ok(creep_data) = external.get_creep_movement_data(*entity) {
+                    if let Some(path_data) = creep_data.path_data.as_mut() {
+                        path_data.stuck_state.denied_by_idle = true;
+                    }
+                }
+            }
+
             if resolved.final_pos == resolved.current_pos {
                 if resolved.desired_pos.is_none() {
                     results.insert(*entity, MovementResult::Arrived);
                     continue;
                 }
+
+                // Per-request ladder: this entity's request may override the system thresholds
+                // (resolved from the requests map — the resolved-creeps loop has no request in
+                // scope directly).
+                let report_thresholds = data
+                    .requests
+                    .get(entity)
+                    .and_then(|r| r.stuck_thresholds.as_ref())
+                    .unwrap_or(&self.stuck_thresholds);
 
                 let stuck_ticks = if let Ok(creep_data) = external.get_creep_movement_data(*entity)
                 {
@@ -787,7 +932,7 @@ where
                         let dist = resolved.current_pos.get_range_to(path_data.destination);
                         path_data.stuck_state.record_immobile(dist);
 
-                        if path_data.stuck_state.should_report_failure_with(&self.stuck_thresholds) {
+                        if path_data.stuck_state.should_report_failure_with(report_thresholds) {
                             results.insert(
                                 *entity,
                                 MovementResult::Failed(MovementFailure::StuckTimeout {
@@ -980,18 +1125,25 @@ where
                             creep_data.path_data = None;
                             (None, None)
                         } else {
-                            if moved {
+                            // DENIAL-AS-STUCK: a resolver denial by an idle occupant last tick
+                            // (flag set in Pass 3) forces IMMOBILE accounting even when the
+                            // creep physically advanced — the avoidance sidestep is a denial in
+                            // motion, and it must feed the escalation ladder instead of
+                            // resetting it every dance step. Consumed here (one tick's worth).
+                            let denied_last_tick =
+                                std::mem::take(&mut path_data.stuck_state.denied_by_idle);
+
+                            if moved && !denied_last_tick {
                                 // The creep advanced along the path — either it
                                 // walked normally or it side-stepped via local
                                 // avoidance and ended up adjacent to a further
                                 // path position. Either way, it made progress.
                                 path_data.stuck_state.record_moved(current_distance);
-                            } else if was_shoved_off {
-                                // Off-path but didn't advance (adjacent only to
-                                // path start). Likely shoved sideways.
-                                path_data.stuck_state.record_immobile(current_distance);
                             } else {
-                                // On-path but at the same position as last tick.
+                                // Off-path without advancing (shoved sideways), on-path at the
+                                // same position as last tick, or an idle-denied sidestep —
+                                // all immobility for ladder purposes.
+                                let _ = was_shoved_off;
                                 path_data.stuck_state.record_immobile(current_distance);
                             }
 
@@ -1013,7 +1165,7 @@ where
             .unwrap_or(false);
         let stuck_needs_repath = stuck_state_snapshot
             .as_ref()
-            .map(|s| s.needs_repath_with(&self.stuck_thresholds))
+            .map(|s| s.needs_repath_with(self.thresholds_for(request)))
             .unwrap_or(false);
         let stuck_state_for_gen = stuck_state_snapshot.unwrap_or_default();
 
@@ -1360,11 +1512,14 @@ where
 
         let mut cost_matrix_options = request.cost_matrix_options.unwrap_or_default();
 
-        if stuck_state.should_avoid_all_friendly_creeps_with(&self.stuck_thresholds) {
+        // Per-request ladder (request-override else system default).
+        let thresholds = self.thresholds_for(request);
+
+        if stuck_state.should_avoid_all_friendly_creeps_with(thresholds) {
             // Tier 1b: avoid ALL friendly creeps in every room (escalation).
             cost_matrix_options.friendly_creeps = true;
             cost_matrix_options.friendly_creep_proximity = None;
-        } else if stuck_state.should_avoid_friendly_creeps_with(&self.stuck_thresholds) {
+        } else if stuck_state.should_avoid_friendly_creeps_with(thresholds) {
             // Tier 1: avoid friendly creeps only within a tile radius of the
             // creep. Creeps further away will have moved by the time we
             // arrive, so including them produces sub-optimal detours.
@@ -1378,7 +1533,7 @@ where
             }
         }
 
-        let ops_multiplier = if stuck_state.should_increase_ops_with(&self.stuck_thresholds) {
+        let ops_multiplier = if stuck_state.should_increase_ops_with(thresholds) {
             2
         } else {
             1
@@ -1535,10 +1690,12 @@ mod tests {
         }
     }
 
-    /// Counts `search` calls and returns a straight horizontal path origin→goal (same room,
-    /// same y — the fixture worlds below keep y fixed). Open terrain everywhere.
+    /// Counts `search` calls (plus each search's origin, for per-creep attribution) and returns a
+    /// straight horizontal path origin→goal (same room, same y — the fixture worlds below keep y
+    /// fixed). Open terrain everywhere.
     struct CountingPathfinder {
         searches: u32,
+        origins: Vec<Position>,
     }
     impl PathfindingProvider for CountingPathfinder {
         fn search(
@@ -1552,6 +1709,7 @@ mod tests {
             _swamp_cost: u8,
         ) -> PathfindingResult {
             self.searches += 1;
+            self.origins.push(origin);
             let y = origin.y().u8();
             let room = origin.room_name();
             let path = (origin.x().u8() + 1..=goal.x().u8())
@@ -1650,7 +1808,7 @@ mod tests {
     fn absent_budgets_mean_unlimited_not_exhausted() {
         let mut cache = CostMatrixCache::default();
         let mut cms = CostMatrixSystem::new(&mut cache, Box::new(NullCostSource));
-        let mut pf = CountingPathfinder { searches: 0 };
+        let mut pf = CountingPathfinder { searches: 0, origins: Vec::new() };
         let mut system: MovementSystem<'_, u32> = MovementSystem::new(&mut cms, &mut pf, None);
 
         assert!(!system.is_cpu_budget_exhausted(), "absent CPU budget = unlimited");
@@ -1676,7 +1834,7 @@ mod tests {
             data: HashMap::new(),
             sink: sink.clone(),
         };
-        let mut pf = CountingPathfinder { searches: 0 };
+        let mut pf = CountingPathfinder { searches: 0, origins: Vec::new() };
 
         // The system is rebuilt per tick (the live shape); external + pathfinder persist.
         for _ in 0..6 {
@@ -1698,48 +1856,288 @@ mod tests {
         );
     }
 
-    // F2 end-to-end at the process() seam: a parked creep registered via
-    // set_idle_creep_positions makes the resolver route AROUND it, where the unregistered
-    // baseline issues a move INTO it (the engine-rejected `failed_into_parked` intent).
+    // F2 end-to-end at the process() seam, post shoveable-idles (ADR 0033 M5 follow-up #2):
+    // a parked creep registered via set_idle_creep_positions gets a synthesized shoveable entry
+    // at the LOWEST movable anchor, so
+    //   - a Normal mover DISPLACES it: the mover is granted the tile AND the idle is issued its
+    //     evacuation move the same tick (a consistent pair — no engine-rejected intent);
+    //   - a Low mover (ties the idle's anchor; the try_shove priority gate denies at stuck 0)
+    //     is denied and sidesteps via local avoidance instead of pathing into the occupant;
+    //   - the UNREGISTERED baseline still optimistically issues the doomed move into the tile
+    //     (the `failed_into_parked` class this registration exists to eliminate).
     #[test]
-    fn registered_idle_occupant_is_routed_around_not_moved_into() {
+    fn registered_idle_occupant_is_displaced_or_sidestepped_never_collided_with() {
         let parked = pos(15, 25);
         let mover_from = pos(14, 25);
 
-        let run = |register: bool| -> Option<Position> {
+        // Returns (mover's issued target, the idle's issued direction if any).
+        let run = |register: bool, priority: Option<MovementPriority>| {
             let sink: Rc<RefCell<HashMap<u32, Direction>>> = Rc::new(RefCell::new(HashMap::new()));
             let mut external = StubExternal {
-                positions: [(1u32, mover_from)].into_iter().collect(),
+                // The idle creep 99 is a LIVING creep the external can serve — it is only
+                // absent from the REQUEST set (the parked, goal-reached shape).
+                positions: [(1u32, mover_from), (99u32, parked)].into_iter().collect(),
                 data: HashMap::new(),
                 sink: sink.clone(),
             };
             let mut cache = CostMatrixCache::default();
             let mut cms = CostMatrixSystem::new(&mut cache, Box::new(NullCostSource));
-            let mut pf = CountingPathfinder { searches: 0 };
+            let mut pf = CountingPathfinder { searches: 0, origins: Vec::new() };
             let mut system = MovementSystem::new(&mut cms, &mut pf, None);
             if register {
-                // Handle 99 is OUTSIDE the request set — a parked (goal-reached) creep.
                 system.set_idle_creep_positions([(parked, 99u32)].into_iter().collect());
             }
             let mut data = MovementData::new();
-            data.move_to(1u32, pos(20, 25));
+            {
+                let mut mr = data.move_to(1u32, pos(20, 25));
+                if let Some(p) = priority {
+                    mr.priority(p);
+                }
+            }
             system.process(&mut external, data);
 
-            let dir = sink.borrow().get(&1).copied()?;
-            let off = dir.into_offset();
-            Some(pos(
-                (mover_from.x().u8() as i32 + off.0) as u8,
-                (mover_from.y().u8() as i32 + off.1) as u8,
-            ))
+            let mover_target = sink.borrow().get(&1).copied().map(|dir| {
+                let off = dir.into_offset();
+                pos(
+                    (mover_from.x().u8() as i32 + off.0) as u8,
+                    (mover_from.y().u8() as i32 + off.1) as u8,
+                )
+            });
+            let idle_dir = sink.borrow().get(&99).copied();
+            (mover_target, idle_dir)
         };
 
         // Baseline (no registration): the optimistic path runs straight through the parked tile
-        // and the resolver cannot know better — the issued move targets it (engine would reject).
-        assert_eq!(run(false), Some(parked), "unregistered baseline paths into the parked tile");
+        // and the resolver cannot know better — the issued move targets it (engine would
+        // reject), and the idle is of course never moved.
+        let (target, idle_dir) = run(false, None);
+        assert_eq!(target, Some(parked), "unregistered baseline paths into the parked tile");
+        assert!(idle_dir.is_none(), "unregistered idle cannot be displaced");
 
-        // Registered: the grant is denied and local avoidance sidesteps — the issued move exists
-        // (no stall) and never targets the occupied tile.
-        let target = run(true).expect("mover must still be issued a move (sidestep), not stall");
-        assert_ne!(target, parked, "registered occupant tile must not be moved into");
+        // Registered + Normal mover: the idle (Low anchor) is SHOVED — both moves are issued as
+        // a consistent pair (idle evacuates, mover takes the tile).
+        let (target, idle_dir) = run(true, None);
+        assert_eq!(
+            target,
+            Some(parked),
+            "a Normal mover displaces the registered idle and takes its tile"
+        );
+        assert!(
+            idle_dir.is_some(),
+            "the displaced idle must be issued its evacuation move the same tick"
+        );
+
+        // Registered + Low mover: the shove priority gate denies (Low ties the idle's anchor,
+        // stuck 0 < threshold) — the mover sidesteps, the idle stays.
+        let (target, idle_dir) = run(true, Some(MovementPriority::Low));
+        let target = target.expect("denied mover must still be issued a sidestep, not stall");
+        assert_ne!(target, parked, "a denied mover must not be issued into the occupied tile");
+        assert!(idle_dir.is_none(), "the undisturbed idle gets no move");
+    }
+
+    // Per-request StuckThresholds (ADR 0033 M5 split-defaults end-state): a request-level ladder
+    // override must change escalation timing for THAT creep only. Two permanently blocked creeps
+    // (StubExternal never moves them) run side by side: the default-ladder creep starts stuck
+    // repathing once ticks_immobile >= avoid_friendly_creeps (2); the overridden creep (a slow
+    // ladder, tier 1 at 6) must not have repathed yet by then. Attribution is by search origin
+    // (the two creeps live on different rows).
+    #[test]
+    fn request_level_ladder_override_changes_escalation_timing_per_creep() {
+        let sink: Rc<RefCell<HashMap<u32, Direction>>> = Rc::new(RefCell::new(HashMap::new()));
+        let default_pos = pos(10, 20);
+        let slow_pos = pos(10, 30);
+        let mut external = StubExternal {
+            positions: [(1u32, default_pos), (2u32, slow_pos)].into_iter().collect(),
+            data: HashMap::new(),
+            sink: sink.clone(),
+        };
+        let mut pf = CountingPathfinder { searches: 0, origins: Vec::new() };
+
+        let slow_ladder = StuckThresholds {
+            avoid_friendly_creeps: 6,
+            avoid_all_friendly_creeps: 8,
+            increase_ops: 10,
+            enable_shoving: 12,
+            report_failure: 24,
+            no_progress_repath: 30,
+        };
+
+        // 5 ticks: the default creep's ticks_immobile reaches tier 1 (2) inside the window and
+        // stuck-repaths; the slow creep's tier 1 (6) never trips.
+        for _ in 0..5 {
+            let mut cache = CostMatrixCache::default();
+            let mut cms = CostMatrixSystem::new(&mut cache, Box::new(NullCostSource));
+            let mut system = MovementSystem::new(&mut cms, &mut pf, None);
+            let mut data = MovementData::new();
+            data.move_to(1u32, pos(20, 20));
+            data.move_to(2u32, pos(20, 30)).stuck_thresholds(slow_ladder.clone());
+            system.process(&mut external, data);
+        }
+
+        let searches_default = pf.origins.iter().filter(|p| **p == default_pos).count();
+        let searches_slow = pf.origins.iter().filter(|p| **p == slow_pos).count();
+        assert!(
+            searches_default >= 2,
+            "default ladder must stuck-repath within the window (searches: {})",
+            searches_default
+        );
+        assert_eq!(
+            searches_slow, 1,
+            "the overridden creep must only have its unconditional first path — its slow ladder \
+             has not reached tier 1 yet (searches: {})",
+            searches_slow
+        );
+    }
+
+    // Escalation-tier shoving (the previously dead tier 3, opt-in via set_shove_escalation):
+    //  - OFF (default): today's behavior exactly — a High-priority mover displaces a Normal
+    //    arrived occupant on the FIRST tick (priority-superior, no stuck requirement);
+    //  - ON: shove becomes an escalation — the same mover may not displace anyone until its own
+    //    ticks_immobile reaches tier 3 (`enable_shoving`), which is also the resolver's stuck
+    //    gate (one knob). The mover sidesteps (local avoidance) in the meantime.
+    // StubExternal freezes positions, so the mover's immobility accrues tick over tick.
+    #[test]
+    fn shove_escalation_gates_displacement_on_tier_three() {
+        let mover_from = pos(14, 25);
+        let occupant_at = pos(15, 25);
+
+        // Returns the 1-based tick at which the occupant was first issued a move (shoved).
+        let first_shove_tick = |escalation: bool, ticks: u32| -> Option<u32> {
+            let sink: Rc<RefCell<HashMap<u32, Direction>>> = Rc::new(RefCell::new(HashMap::new()));
+            let mut external = StubExternal {
+                positions: [(1u32, mover_from), (2u32, occupant_at)].into_iter().collect(),
+                data: HashMap::new(),
+                sink: sink.clone(),
+            };
+            let mut pf = CountingPathfinder { searches: 0, origins: Vec::new() };
+            for tick in 1..=ticks {
+                let mut cache = CostMatrixCache::default();
+                let mut cms = CostMatrixSystem::new(&mut cache, Box::new(NullCostSource));
+                let mut system = MovementSystem::new(&mut cms, &mut pf, None);
+                system.set_shove_escalation(escalation);
+                let mut data = MovementData::new();
+                data.move_to(1u32, pos(20, 25)).priority(MovementPriority::High);
+                // The occupant is ARRIVED at its own destination (a stationed worker): it keeps
+                // a request (so it is an ACTIVE, shove-consenting entry) but never moves itself.
+                data.move_to(2u32, occupant_at);
+                sink.borrow_mut().clear();
+                system.process(&mut external, data);
+                if sink.borrow().contains_key(&2) {
+                    return Some(tick);
+                }
+            }
+            None
+        };
+
+        // OFF: priority-superiority shoves immediately (the historical behavior, preserved).
+        assert_eq!(
+            first_shove_tick(false, 4),
+            Some(1),
+            "escalation OFF must preserve first-tick priority shoving"
+        );
+
+        // ON: nothing may be displaced until the mover's own tier 3 (default enable_shoving = 7)
+        // fires; with frozen positions ticks_immobile reaches 7 around tick 8-9.
+        let shoved_at = first_shove_tick(true, 15).expect("tier 3 must eventually fire");
+        assert!(
+            shoved_at > 7,
+            "escalation ON must delay the shove until tier 3 (fired at tick {})",
+            shoved_at
+        );
+
+        // ON + a fast per-request ladder: tier 3 at 2 fires much earlier — the escalation knob
+        // is the RequestED creep's own thresholds (per-request, not system-wide).
+        let fast_ladder = StuckThresholds {
+            enable_shoving: 2,
+            ..StuckThresholds::default()
+        };
+        let first_shove_fast = {
+            let sink: Rc<RefCell<HashMap<u32, Direction>>> = Rc::new(RefCell::new(HashMap::new()));
+            let mut external = StubExternal {
+                positions: [(1u32, mover_from), (2u32, occupant_at)].into_iter().collect(),
+                data: HashMap::new(),
+                sink: sink.clone(),
+            };
+            let mut pf = CountingPathfinder { searches: 0, origins: Vec::new() };
+            let mut result = None;
+            for tick in 1..=15u32 {
+                let mut cache = CostMatrixCache::default();
+                let mut cms = CostMatrixSystem::new(&mut cache, Box::new(NullCostSource));
+                let mut system = MovementSystem::new(&mut cms, &mut pf, None);
+                system.set_shove_escalation(true);
+                let mut data = MovementData::new();
+                data.move_to(1u32, pos(20, 25))
+                    .priority(MovementPriority::High)
+                    .stuck_thresholds(fast_ladder.clone());
+                data.move_to(2u32, occupant_at);
+                sink.borrow_mut().clear();
+                system.process(&mut external, data);
+                if sink.borrow().contains_key(&2) {
+                    result = Some(tick);
+                    break;
+                }
+            }
+            result
+        };
+        let fast_tick = first_shove_fast.expect("fast ladder tier 3 must fire");
+        assert!(
+            fast_tick < shoved_at,
+            "a per-request enable_shoving=2 must fire earlier than the default 7 ({} vs {})",
+            fast_tick,
+            shoved_at
+        );
+    }
+
+    // DENIAL-AS-STUCK, the load-bearing conversion: a creep that physically ADVANCED along its
+    // path (the record_moved shape — e.g. the avoidance dance stepping via tiles that alias
+    // path progress) but whose last resolution was denied by an idle occupant must record
+    // IMMOBILE, not reset the ladder. Pre-seeded path state isolates exactly the conversion:
+    // without the flag consumption this creep's ticks_immobile would reset 3 -> 0.
+    #[test]
+    fn denied_by_idle_converts_path_progress_into_immobility() {
+        let sink: Rc<RefCell<HashMap<u32, Direction>>> = Rc::new(RefCell::new(HashMap::new()));
+        let destination = pos(20, 25);
+        let mut external = StubExternal {
+            positions: [(1u32, pos(15, 25))].into_iter().collect(),
+            data: HashMap::new(),
+            sink: sink.clone(),
+        };
+        // Pre-seed: the creep advanced to path[1] since last tick (on-path, idx 1 = the
+        // record_moved shape), with 3 immobile ticks accrued and the denial flag set by the
+        // previous tick's Pass 3.
+        let mut stuck_state = StuckState {
+            ticks_immobile: 3,
+            denied_by_idle: true,
+            last_distance: 6,
+            ..Default::default()
+        };
+        stuck_state.ticks_no_progress = 0;
+        external.data.insert(
+            1,
+            CreepMovementData {
+                path_data: Some(CreepPathData {
+                    destination,
+                    range: 0,
+                    path: vec![pos(14, 25), pos(15, 25), pos(16, 25), pos(17, 25)],
+                    time: 0,
+                    stuck_state,
+                }),
+            },
+        );
+
+        let mut cache = CostMatrixCache::default();
+        let mut cms = CostMatrixSystem::new(&mut cache, Box::new(NullCostSource));
+        let mut pf = CountingPathfinder { searches: 0, origins: Vec::new() };
+        let mut system = MovementSystem::new(&mut cms, &mut pf, None);
+        let mut data = MovementData::new();
+        data.move_to(1u32, destination);
+        system.process(&mut external, data);
+
+        let state = &external.data[&1].path_data.as_ref().unwrap().stuck_state;
+        assert_eq!(
+            state.ticks_immobile, 4,
+            "an idle-denied 'advance' must ACCRUE immobility (would reset to 0 without the flag)"
+        );
+        assert!(!state.denied_by_idle, "the flag is one tick's worth — consumed");
     }
 }

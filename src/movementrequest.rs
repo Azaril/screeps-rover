@@ -1,4 +1,5 @@
 use super::costmatrixsystem::*;
+use super::movementsystem::StuckThresholds;
 use screeps::local::*;
 use std::hash::Hash;
 
@@ -49,6 +50,26 @@ pub enum MovementPriority {
     High,
 }
 
+impl MovementPriority {
+    /// The enum's NUMERIC ANCHOR on the shared i64 priority lane (ADR 0033 §D5.4 decision #9 —
+    /// the w-as-priority substrate). The resolver compares `MovementRequest::priority_value`
+    /// falling back to this anchor, so enum-only requests keep EXACTLY the derived `Ord` total
+    /// order (anchors are strictly monotone in variant order), while a caller-supplied numeric
+    /// priority (e.g. §D5.4's quantized `w(creep)` in milli-e/t) slots BETWEEN anchors: the
+    /// 1_000_000 spacing leaves room for w up to 1000 e/t at milli-e/t quantization between any
+    /// two adjacent tiers. `Immovable` anchors below `Low` (it never moves and loses every
+    /// contest, matching the derived ordering); its no-shove/no-swap semantics stay ENUM-checked
+    /// in the resolver, never value-checked.
+    pub fn anchor_value(self) -> i64 {
+        match self {
+            MovementPriority::Immovable => -1_000_000,
+            MovementPriority::Low => 0,
+            MovementPriority::Normal => 1_000_000,
+            MovementPriority::High => 2_000_000,
+        }
+    }
+}
+
 /// A target to flee from.
 #[derive(Clone)]
 pub struct FleeTarget {
@@ -97,9 +118,20 @@ pub struct MovementRequest<Handle> {
     pub(crate) cost_matrix_options: Option<CostMatrixOptions>,
     pub(crate) visualize: bool,
     pub(crate) priority: MovementPriority,
+    /// Optional NUMERIC priority on the shared i64 lane (see
+    /// [`MovementPriority::anchor_value`]). `None` (the default) = the enum's anchor, which is
+    /// byte-identical to the historical enum-only ordering; `Some(v)` lets a caller bid a
+    /// quantized value (§D5.4 `w(creep)` in milli-e/t) that slots between the enum tiers.
+    /// Ties keep the exact historical tie-break (stuck_ticks, then Handle).
+    pub(crate) priority_value: Option<i64>,
     pub(crate) allow_shove: bool,
     pub(crate) allow_swap: bool,
     pub(crate) anchor: Option<AnchorConstraint>,
+    /// Per-request stuck-escalation ladder override (ADR 0033 M5 combat-adjudication end-state:
+    /// SPLIT DEFAULTS — haul jobs pass a slow ladder like `ladder(8)` for the +H, military keeps
+    /// the fast system default). `None` = the system-level `MovementSystem::stuck_thresholds`,
+    /// which is byte-identical to the historical behavior.
+    pub(crate) stuck_thresholds: Option<StuckThresholds>,
 }
 
 impl<Handle> MovementRequest<Handle> {
@@ -113,9 +145,11 @@ impl<Handle> MovementRequest<Handle> {
             cost_matrix_options: None,
             visualize: true,
             priority: MovementPriority::default(),
+            priority_value: None,
             allow_shove: true,
             allow_swap: true,
             anchor: None,
+            stuck_thresholds: None,
         }
     }
 
@@ -131,9 +165,11 @@ impl<Handle> MovementRequest<Handle> {
             cost_matrix_options: None,
             visualize: true,
             priority: MovementPriority::default(),
+            priority_value: None,
             allow_shove: true,
             allow_swap: true,
             anchor: None,
+            stuck_thresholds: None,
         }
     }
 
@@ -144,10 +180,18 @@ impl<Handle> MovementRequest<Handle> {
             cost_matrix_options: None,
             visualize: true,
             priority: MovementPriority::High,
+            priority_value: None,
             allow_shove: false,
             allow_swap: true,
             anchor: None,
+            stuck_thresholds: None,
         }
+    }
+
+    /// The effective i64 contention priority: the caller's numeric bid if set, else the enum's
+    /// anchor. This single value is what the resolver orders by (winner selection + shove gates).
+    pub fn effective_priority(&self) -> i64 {
+        self.priority_value.unwrap_or_else(|| self.priority.anchor_value())
     }
 
     /// Get the destination position for MoveTo intents. For Follow/Flee, returns None.
@@ -248,6 +292,15 @@ impl<'a, Handle> MovementRequestBuilder<'a, Handle> {
         self
     }
 
+    /// Set a NUMERIC priority on the shared i64 lane (see [`MovementPriority::anchor_value`] for
+    /// the enum anchors and spacing). Overrides the enum for resolver ordering; leave unset for
+    /// the historical enum-only behavior.
+    pub fn priority_value(&mut self, value: i64) -> &mut Self {
+        self.request.priority_value = Some(value);
+
+        self
+    }
+
     pub fn allow_shove(&mut self, allow: bool) -> &mut Self {
         self.request.allow_shove = allow;
 
@@ -263,6 +316,15 @@ impl<'a, Handle> MovementRequestBuilder<'a, Handle> {
     /// Set an anchor constraint.
     pub fn anchor(&mut self, constraint: AnchorConstraint) -> &mut Self {
         self.request.anchor = Some(constraint);
+
+        self
+    }
+
+    /// Override the stuck-escalation ladder for THIS request only (the ADR 0033 split-defaults
+    /// end-state: per-job `StuckThresholds`, e.g. `ladder(8)` for haul, system default for
+    /// military). Unset = the system-level thresholds.
+    pub fn stuck_thresholds(&mut self, thresholds: StuckThresholds) -> &mut Self {
+        self.request.stuck_thresholds = Some(thresholds);
 
         self
     }

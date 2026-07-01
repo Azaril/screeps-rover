@@ -7,14 +7,27 @@ use std::hash::Hash;
 /// Default maximum depth for shove chains to prevent unbounded recursion.
 pub(crate) const DEFAULT_MAX_SHOVE_DEPTH: u32 = 10;
 
+/// Minimum stuck ticks before a lower-or-equal priority creep is allowed to shove a
+/// higher-priority occupant (gives the pathfinder time to find an alternative route before
+/// resorting to displacement). This is the HISTORICAL tier-3 constant: it is the
+/// `ShoveContext::stuck_shove_threshold` whenever shove-escalation mode is OFF, so default
+/// behavior is exactly the old hardcoded gate. With escalation ON, the movement system injects
+/// the per-request `StuckThresholds::enable_shoving` here instead — tier 3 has ONE knob.
+pub(crate) const STUCK_SHOVE_THRESHOLD: u32 = 5;
+
 /// Context about the creep initiating a shove, passed through the chain so
 /// every level can compare its priority and stuck state against the occupant.
 #[derive(Clone, Copy)]
 struct ShoveContext {
-    /// Priority of the original creep that wants the tile.
-    priority: MovementPriority,
+    /// Effective i64 priority of the original creep that wants the tile (numeric lane —
+    /// `MovementPriority::anchor_value` for enum-only requests).
+    priority: i64,
     /// How many ticks the original creep has been stuck (immobile).
     stuck_ticks: u32,
+    /// The stuck-ticks gate for this shover: `STUCK_SHOVE_THRESHOLD` (escalation OFF, the
+    /// historical constant) or the shover's effective `StuckThresholds::enable_shoving`
+    /// (escalation ON) — the unified tier-3 knob.
+    stuck_shove_threshold: u32,
 }
 
 /// Try local avoidance: find an adjacent tile the creep can step to that keeps
@@ -108,8 +121,25 @@ pub(crate) struct ResolvedCreep<Handle: Hash + Eq + Copy> {
     pub entity: Handle,
     pub current_pos: Position,
     pub desired_pos: Option<Position>,
+    /// Enum priority — kept for its SEMANTIC checks (`Immovable` can never be displaced); all
+    /// ORDERING goes through `priority_value` (the numeric lane).
     pub priority: MovementPriority,
+    /// Effective i64 contention priority (`MovementRequest::effective_priority`): the request's
+    /// numeric bid if set, else the enum anchor. With no bids anywhere this orders EXACTLY like
+    /// the enum (`MovementPriority::anchor_value` is monotone in variant order).
+    pub priority_value: i64,
+    /// Occupant-side consent: may OTHER creeps displace this one (the historical
+    /// `MovementRequest::allow_shove` meaning — unchanged by escalation mode).
     pub allow_shove: bool,
+    /// Shover-side right: may THIS creep initiate shoves. Always `true` with escalation mode OFF
+    /// (today's behavior: any winner attempts the shove and `try_shove`'s own gates decide);
+    /// with `set_shove_escalation(true)` it is `request.allow_shove && tier 3 reached`
+    /// (`StuckThresholds::enable_shoving`) — shove becomes an ESCALATION, not a default.
+    pub shove_enabled: bool,
+    /// This creep's tier-3 knob as a shover (threaded into `ShoveContext::stuck_shove_threshold`):
+    /// `STUCK_SHOVE_THRESHOLD` when escalation is OFF (the historical constant), the effective
+    /// `StuckThresholds::enable_shoving` when ON.
+    pub shove_stuck_threshold: u32,
     pub allow_swap: bool,
     pub stuck_ticks: u32,
     /// Was this creep's movement resolved (i.e. a direction was decided)?
@@ -118,6 +148,11 @@ pub(crate) struct ResolvedCreep<Handle: Hash + Eq + Copy> {
     pub final_pos: Position,
     /// True if this creep had a movement request (vs idle creep).
     pub has_request: bool,
+    /// Set when this creep's grant was DENIED because of an idle occupant — whether the outcome
+    /// was an avoidance sidestep, a stay, or the sealed-corridor optimistic push. The movement
+    /// system converts this into stuck-immobility even if the creep physically moved (the
+    /// avoidance DANCE must feed the escalation ladder — ADR 0033 M5 denial-as-stuck).
+    pub denied_by_idle: bool,
     /// Optional anchor constraint: if set, shoves/swaps must keep this creep
     /// within `anchor.range` of `anchor.position`.
     pub anchor: Option<AnchorConstraint>,
@@ -420,15 +455,17 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
     for tile in &tiles {
         let candidates = &intent_map[tile];
 
-        // Pick the best candidate (highest priority, then most stuck).
+        // Pick the best candidate (highest priority, then most stuck). Ordering is the NUMERIC
+        // priority lane (`priority_value` — enum anchors when no bid, so enum-only requests keep
+        // the exact historical total order); ties break exactly as before.
         let winner = candidates
             .iter()
             .filter(|h| !creeps[*h].resolved)
             .max_by(|a, b| {
                 let ca = &creeps[*a];
                 let cb = &creeps[*b];
-                ca.priority
-                    .cmp(&cb.priority)
+                ca.priority_value
+                    .cmp(&cb.priority_value)
                     .then_with(|| ca.stuck_ticks.cmp(&cb.stuck_ticks))
                     // Final tie-break on the Handle so the contested-tile winner
                     // is a pure function of (priority, stuck_ticks, Handle) and
@@ -482,21 +519,25 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
             if occupant != winner_handle {
                 let winner_creep = &creeps[&winner_handle];
                 let shover = ShoveContext {
-                    priority: winner_creep.priority,
+                    priority: winner_creep.priority_value,
                     stuck_ticks: winner_creep.stuck_ticks,
+                    stuck_shove_threshold: winner_creep.shove_stuck_threshold,
                 };
                 // The tile is occupied. Try to shove the occupant away.
                 // Pass the winner's priority and stuck_ticks so try_shove can
-                // decide whether the shove is justified.
-                let shoved = try_shove(
-                    occupant,
-                    creeps,
-                    idle_creep_positions,
-                    is_tile_walkable,
-                    0,
-                    max_shove_depth,
-                    shover,
-                );
+                // decide whether the shove is justified. `shove_enabled` is the shover-side
+                // escalation gate: always true with escalation mode OFF (today's behavior);
+                // with it ON a winner may only initiate shoves once its own tier 3 fired.
+                let shoved = winner_creep.shove_enabled
+                    && try_shove(
+                        occupant,
+                        creeps,
+                        idle_creep_positions,
+                        is_tile_walkable,
+                        0,
+                        max_shove_depth,
+                        shover,
+                    );
                 if !shoved {
                     // Shove was denied (likely priority gate). Before giving up
                     // and leaving the winner stuck, try local avoidance: find an
@@ -518,21 +559,40 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
                         is_tile_walkable,
                     );
 
+                    // An IDLE occupant = one with no movement request this tick: either a
+                    // registered position with no `ResolvedCreep` entry at all (the raw
+                    // `set_idle_creep_positions` map at this seam) or a synthesized
+                    // `has_request: false` entry (the shoveable-idle path).
+                    let idle_occupant = creeps
+                        .get(&occupant)
+                        .map(|c| !c.has_request)
+                        .unwrap_or(true);
+
                     if avoidance_tile.is_none() {
-                        // SEALED-CORRIDOR FALLBACK: a registered IDLE occupant (no `ResolvedCreep`
-                        // entry — unshoveable by construction) that also leaves no avoidance tile
-                        // has sealed the winner's only way through. Hard-denying here STARVES
-                        // single-corridor routes (a parked hauler on a corridor mouth pinned its
-                        // mate forever — the rover-eval corpus ratchets caught it), so degrade to
-                        // the optimistic push instead: issue the move and let the engine
-                        // adjudicate. If the idle creep is really still there the intent fails
-                        // and the stuck-escalation ladder takes over — exactly the
-                        // pre-registration behavior as the last resort — and a live idle may
+                        // SEALED-CORRIDOR FALLBACK: an idle occupant (shove denied/failed) that
+                        // also leaves no avoidance tile has sealed the winner's only way through.
+                        // Hard-denying here STARVES single-corridor routes (a parked hauler on a
+                        // corridor mouth pinned its mate forever — the rover-eval corpus ratchets
+                        // caught it), so degrade to the optimistic push instead: issue the move
+                        // and let the engine adjudicate. If the idle creep is really still there
+                        // the intent fails and the stuck-escalation ladder takes over — exactly
+                        // the pre-registration behavior as the last resort — and a live idle may
                         // simply move next tick. ACTIVE occupants keep the hard deny (the
                         // resolver planned them; pushing into them is a known-doomed intent).
-                        let idle_occupant = !creeps.contains_key(&occupant);
                         if !idle_occupant {
                             winner_can_move = false;
+                        }
+                    }
+
+                    // DENIAL-AS-STUCK (ADR 0033 M5 follow-up #2): every idle-occupant denial —
+                    // avoidance sidestep, hard stay, or the optimistic push — is marked so the
+                    // movement system records IMMOBILE even if the creep physically sidestepped.
+                    // Without this the avoidance DANCE keeps `ticks_immobile` at 0 forever and
+                    // no escalation tier can ever fire against a parked blocker (the
+                    // zero-failed-intent dance livelock the corpus ratchets caught).
+                    if idle_occupant {
+                        if let Some(winner_creep) = creeps.get_mut(&winner_handle) {
+                            winner_creep.denied_by_idle = true;
                         }
                     }
                 }
@@ -685,12 +745,14 @@ fn resolve_swaps<Handle: Hash + Eq + Copy + Ord>(
 
 /// Try to shove a creep out of the way. Returns true if successful.
 ///
-/// `shover_priority` is the priority of the creep that wants the tile. A shove
-/// is only attempted when the shover's priority is strictly greater than the
-/// occupant's priority, OR when the shover has been stuck long enough that no
-/// alternative path exists (`shover_stuck_ticks >= STUCK_SHOVE_THRESHOLD`).
-/// This prevents low-priority creeps from casually displacing high-priority
-/// stationed creeps (e.g. miners) when they could simply path around.
+/// `shover.priority` is the (numeric) priority of the creep that wants the tile. A shove is only
+/// attempted when the shover's priority is strictly greater than the occupant's, OR when the
+/// shover has been stuck long enough that no alternative path exists
+/// (`shover.stuck_ticks >= shover.stuck_shove_threshold` — the constant
+/// [`STUCK_SHOVE_THRESHOLD`] with escalation mode off, the injectable
+/// `StuckThresholds::enable_shoving` with it on). This prevents low-priority creeps from
+/// casually displacing high-priority stationed creeps (e.g. miners) when they could simply
+/// path around.
 ///
 /// Supports chain-shoving: if all adjacent tiles are occupied, it will
 /// recursively attempt to shove occupants up to `max_shove_depth` levels deep.
@@ -703,11 +765,6 @@ fn try_shove<Handle: Hash + Eq + Copy + Ord>(
     max_shove_depth: u32,
     shover: ShoveContext,
 ) -> bool {
-    /// Minimum stuck ticks before a lower-or-equal priority creep is allowed
-    /// to shove a higher-priority occupant. This gives the pathfinder time to
-    /// find an alternative route before resorting to displacement.
-    const STUCK_SHOVE_THRESHOLD: u32 = 5;
-
     if depth >= max_shove_depth {
         return false;
     }
@@ -728,7 +785,7 @@ fn try_shove<Handle: Hash + Eq + Copy + Ord>(
     // Only shove if the shover outranks the occupant, or has been stuck long
     // enough that no alternative path exists. This prevents casual displacement
     // of stationed miners by passing haulers.
-    if shover.priority <= creep.priority && shover.stuck_ticks < STUCK_SHOVE_THRESHOLD {
+    if shover.priority <= creep.priority_value && shover.stuck_ticks < shover.stuck_shove_threshold {
         return false;
     }
 
@@ -899,12 +956,16 @@ mod tests {
             current_pos: at,
             desired_pos: None,
             priority: MovementPriority::Low,
+            priority_value: MovementPriority::Low.anchor_value(),
             allow_shove: true,
+            shove_enabled: true,
+            shove_stuck_threshold: STUCK_SHOVE_THRESHOLD,
             allow_swap: false,
             stuck_ticks: 0,
             resolved: false,
             final_pos: at,
             has_request: false,
+            denied_by_idle: false,
             anchor: None,
         }
     }
@@ -921,8 +982,9 @@ mod tests {
         // Every neighbor is structure-blocked except one.
         let is_tile_walkable = |p: Position| -> bool { p == open };
         let shover = ShoveContext {
-            priority: MovementPriority::High,
+            priority: MovementPriority::High.anchor_value(),
             stuck_ticks: 0,
+            stuck_shove_threshold: STUCK_SHOVE_THRESHOLD,
         };
 
         let shoved = try_shove(
@@ -948,8 +1010,9 @@ mod tests {
         // Structures block every neighbor.
         let is_tile_walkable = |_: Position| -> bool { false };
         let shover = ShoveContext {
-            priority: MovementPriority::High,
+            priority: MovementPriority::High.anchor_value(),
             stuck_ticks: 0,
+            stuck_shove_threshold: STUCK_SHOVE_THRESHOLD,
         };
 
         let shoved = try_shove(
@@ -1006,12 +1069,16 @@ mod tests {
             // so (priority, stuck_ticks) is a full tie and only the Handle
             // tie-break decides the winner.
             priority: MovementPriority::Normal,
+            priority_value: MovementPriority::Normal.anchor_value(),
             allow_shove: true,
+            shove_enabled: true,
+            shove_stuck_threshold: STUCK_SHOVE_THRESHOLD,
             allow_swap: true,
             stuck_ticks: 0,
             resolved: false,
             final_pos: at,
             has_request: true,
+            denied_by_idle: false,
             anchor: None,
         }
     }
@@ -1116,5 +1183,65 @@ mod tests {
             1,
             "avoidance keeps the creep adjacent to the blocked tile so it resumes next tick"
         );
+        // DENIAL-AS-STUCK: the idle denial is marked even though the creep sidestepped — the
+        // movement system converts this into immobility so the dance feeds the ladder.
+        assert!(creeps[&1].denied_by_idle, "idle denial (avoidance outcome) must be marked");
+    }
+
+    // denied_by_idle is IDLE-specific: a denial caused by an ACTIVE (requested) occupant that
+    // refuses displacement is the normal contention path — it must NOT be marked, or every
+    // ordinary traffic jam would be booked as an idle denial.
+    #[test]
+    fn active_occupant_denial_is_not_marked_denied_by_idle() {
+        let from = pos(10, 25);
+        let blocked = pos(11, 25);
+        let mut creeps: HashMap<u32, ResolvedCreep<u32>> = HashMap::new();
+        creeps.insert(1, mover(1, from, blocked));
+        // A stationary ACTIVE occupant (has_request: true, e.g. an arrived creep) that consents
+        // to nothing: shove fails, so the winner is denied and sidesteps.
+        let mut blocker = mover(2, blocked, blocked);
+        blocker.desired_pos = None;
+        blocker.allow_shove = false;
+        blocker.allow_swap = false;
+        creeps.insert(2, blocker);
+
+        resolve_conflicts(&mut creeps, &HashMap::new(), &|_| true, DEFAULT_MAX_SHOVE_DEPTH);
+
+        assert_ne!(creeps[&1].final_pos, blocked, "denied by the unshoveable active occupant");
+        assert!(
+            !creeps[&1].denied_by_idle,
+            "an ACTIVE-occupant denial must not be marked as an idle denial"
+        );
+    }
+
+    // The numeric priority lane (ADR 0033 §D5.4 decision #9): a priority_value BETWEEN the enum
+    // anchors must lose to the higher enum tier and beat the lower one, with enum-only ordering
+    // unchanged (anchors are monotone). 1_500_000 sits between Normal (1M) and High (2M).
+    #[test]
+    fn priority_value_slots_between_enum_anchors() {
+        let contested = pos(20, 24);
+
+        // vs High: the enum-High creep must win the contested tile.
+        let mut creeps: HashMap<u32, ResolvedCreep<u32>> = HashMap::new();
+        let mut bidder = mover(1, pos(20, 25), contested);
+        bidder.priority_value = 1_500_000;
+        creeps.insert(1, bidder.clone());
+        let mut high = mover(2, pos(20, 23), contested);
+        high.priority = MovementPriority::High;
+        high.priority_value = MovementPriority::High.anchor_value();
+        creeps.insert(2, high);
+        resolve_conflicts(&mut creeps, &HashMap::new(), &|_| true, DEFAULT_MAX_SHOVE_DEPTH);
+        assert_eq!(creeps[&2].final_pos, contested, "enum High must beat a 1.5M numeric bid");
+        assert_ne!(creeps[&1].final_pos, contested, "the numeric bidder loses to High");
+
+        // vs Normal: the numeric bid must beat the plain Normal anchor. Note the bidder takes
+        // the LOWER Handle here — under the pure (priority, stuck, Handle) tie-break order the
+        // higher Handle would win, so a bidder victory proves the VALUE decided it.
+        let mut creeps: HashMap<u32, ResolvedCreep<u32>> = HashMap::new();
+        creeps.insert(1, bidder);
+        creeps.insert(2, mover(2, pos(20, 23), contested));
+        resolve_conflicts(&mut creeps, &HashMap::new(), &|_| true, DEFAULT_MAX_SHOVE_DEPTH);
+        assert_eq!(creeps[&1].final_pos, contested, "a 1.5M numeric bid must beat enum Normal");
+        assert_ne!(creeps[&2].final_pos, contested, "plain Normal loses to the numeric bidder");
     }
 }
