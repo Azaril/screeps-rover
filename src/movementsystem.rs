@@ -20,6 +20,18 @@ const MAX_PATHFIND_OPS: u32 = 20_000;
 /// Default per-tick pathfinding ops budget (20 CPU). Enforced so movement cannot exhaust the tick.
 const DEFAULT_PATHFIND_OPS_BUDGET: u32 = 20_000;
 
+/// Default ticks a cached path is followed before an expiry repath — i.e. PATH COMMITMENT.
+/// TUNED 5 → 20 by the screeps-rover-eval parameter tournament (ADR 0033 §D5.4, 2026-07-01):
+/// with 5, a creep whose stuck-escalation found a detour re-optimized back onto the blocked
+/// optimistic path within 5 ticks and FLAPPED between the two forever (a livelock reproduced on
+/// 2 of 13 real foreman-planned rooms — a finished hauler parking on a 1-wide road-corridor
+/// mouth sealed its mate in; constant motion kept deadlock detectors silent). 20 commits to the
+/// detour long enough to pass: corpus completion 0.844 → 1.000, wasted intents 832 → 28,
+/// value-weighted efficiency H 0.680 → 0.769 — and FEWER expiry repaths = less CPU. Safe for
+/// dynamic movement: a destination/range change still discards the path immediately (see
+/// `dest_matches` below), so only stable-destination routes (hauling) feel the longer reuse.
+const DEFAULT_REUSE_PATH_LENGTH: u32 = 20;
+
 /// Configurable thresholds for stuck detection tiers.
 /// Different job types can use different thresholds (e.g. military creeps
 /// might have lower thresholds for faster reaction).
@@ -147,8 +159,12 @@ impl StuckState {
     }
 
     pub fn needs_repath(&self) -> bool {
-        self.ticks_immobile >= StuckThresholds::default().avoid_friendly_creeps
-            || self.should_repath_no_progress()
+        self.needs_repath_with(&StuckThresholds::default())
+    }
+
+    pub fn needs_repath_with(&self, thresholds: &StuckThresholds) -> bool {
+        self.ticks_immobile >= thresholds.avoid_friendly_creeps
+            || self.should_repath_no_progress_with(thresholds)
     }
 }
 
@@ -286,6 +302,11 @@ pub struct MovementSystem<'a, Handle> {
     /// disable proximity limiting (equivalent to the old behaviour of avoiding
     /// all creeps).
     friendly_creep_distance: u32,
+    /// The stuck-escalation ladder (how many immobile ticks before each tier fires:
+    /// friendly-avoid → all-friendly-avoid → more ops → shove → report failure). Injectable so the
+    /// escalation SPEED is tunable per deployment (and benchmarkable offline); defaults preserve
+    /// the historical ladder exactly.
+    stuck_thresholds: StuckThresholds,
     /// CPU budget for stuck repathing. When exhausted, the movement system
     /// skips pathfinding for stuck creeps (they keep their existing path and
     /// the resolver's shove/swap mechanisms can still help). Only
@@ -338,9 +359,14 @@ where
             cost_matrix_system,
             pathfinder,
             visualizer,
-            reuse_path_length: 5,
+            reuse_path_length: DEFAULT_REUSE_PATH_LENGTH,
             max_shove_depth: DEFAULT_MAX_SHOVE_DEPTH,
             friendly_creep_distance: DEFAULT_FRIENDLY_CREEP_DISTANCE,
+            // NOTE: the same tournament found ladder(8) (a 4× slower escalation) adds a further
+            // +0.08 H on the HAUL corpus — but it rewrites the report_failure job-layer contract
+            // (12 → 48 ticks) and is unvalidated for combat movement (immobility under fire), so
+            // it stays a recorded candidate, not the default. See ADR 0033 §D5.4.
+            stuck_thresholds: StuckThresholds::default(),
             cpu_budget: None,
             repath_budget: None,
             pathfinding_ops_budget_cap: DEFAULT_PATHFIND_OPS_BUDGET,
@@ -401,6 +427,13 @@ where
     /// creeps get avoided when the tier is active).
     pub fn set_friendly_creep_distance(&mut self, distance: u32) {
         self.friendly_creep_distance = distance;
+    }
+
+    /// Set the stuck-escalation ladder (see [`StuckThresholds`]). Every stuck check the system
+    /// performs routes through this — tune it to trade wasted-intent burn (slow escalation)
+    /// against premature detours (fast escalation).
+    pub fn set_stuck_thresholds(&mut self, thresholds: StuckThresholds) {
+        self.stuck_thresholds = thresholds;
     }
 
     /// Set a CPU budget for the movement system. `get_cpu` returns the
@@ -711,7 +744,7 @@ where
                         let dist = resolved.current_pos.get_range_to(path_data.destination);
                         path_data.stuck_state.record_immobile(dist);
 
-                        if path_data.stuck_state.should_report_failure() {
+                        if path_data.stuck_state.should_report_failure_with(&self.stuck_thresholds) {
                             results.insert(
                                 *entity,
                                 MovementResult::Failed(MovementFailure::StuckTimeout {
@@ -937,7 +970,7 @@ where
             .unwrap_or(false);
         let stuck_needs_repath = stuck_state_snapshot
             .as_ref()
-            .map(|s| s.needs_repath())
+            .map(|s| s.needs_repath_with(&self.stuck_thresholds))
             .unwrap_or(false);
         let stuck_state_for_gen = stuck_state_snapshot.unwrap_or_default();
 
@@ -1284,11 +1317,11 @@ where
 
         let mut cost_matrix_options = request.cost_matrix_options.unwrap_or_default();
 
-        if stuck_state.should_avoid_all_friendly_creeps() {
+        if stuck_state.should_avoid_all_friendly_creeps_with(&self.stuck_thresholds) {
             // Tier 1b: avoid ALL friendly creeps in every room (escalation).
             cost_matrix_options.friendly_creeps = true;
             cost_matrix_options.friendly_creep_proximity = None;
-        } else if stuck_state.should_avoid_friendly_creeps() {
+        } else if stuck_state.should_avoid_friendly_creeps_with(&self.stuck_thresholds) {
             // Tier 1: avoid friendly creeps only within a tile radius of the
             // creep. Creeps further away will have moved by the time we
             // arrive, so including them produces sub-optimal detours.
@@ -1302,7 +1335,7 @@ where
             }
         }
 
-        let ops_multiplier = if stuck_state.should_increase_ops() {
+        let ops_multiplier = if stuck_state.should_increase_ops_with(&self.stuck_thresholds) {
             2
         } else {
             1
