@@ -519,7 +519,21 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
                     );
 
                     if avoidance_tile.is_none() {
-                        winner_can_move = false;
+                        // SEALED-CORRIDOR FALLBACK: a registered IDLE occupant (no `ResolvedCreep`
+                        // entry — unshoveable by construction) that also leaves no avoidance tile
+                        // has sealed the winner's only way through. Hard-denying here STARVES
+                        // single-corridor routes (a parked hauler on a corridor mouth pinned its
+                        // mate forever — the rover-eval corpus ratchets caught it), so degrade to
+                        // the optimistic push instead: issue the move and let the engine
+                        // adjudicate. If the idle creep is really still there the intent fails
+                        // and the stuck-escalation ladder takes over — exactly the
+                        // pre-registration behavior as the last resort — and a live idle may
+                        // simply move next tick. ACTIVE occupants keep the hard deny (the
+                        // resolver planned them; pushing into them is a known-doomed intent).
+                        let idle_occupant = !creeps.contains_key(&occupant);
+                        if !idle_occupant {
+                            winner_can_move = false;
+                        }
                     }
                 }
             }
@@ -1077,5 +1091,30 @@ mod tests {
         for c in creeps.values() {
             assert!(seen.insert(c.final_pos), "duplicate final_pos {:?}", c.final_pos);
         }
+    }
+
+    // The `idle_creep_positions` registration seam (ADR 0033 §M4 F2): an occupant registered
+    // OUTSIDE the request set (no `ResolvedCreep` entry — the parked, goal-reached shape) must
+    // deny the grant path. Unshovable (no entry to shove), so the winner takes local avoidance:
+    // it sidesteps rather than being issued INTO the occupied tile (which the engine would
+    // reject — one wasted intent) and rather than stalling in place.
+    #[test]
+    fn registered_idle_occupant_denies_grant_and_forces_avoidance() {
+        let from = pos(10, 25);
+        let blocked = pos(11, 25);
+        let mut creeps: HashMap<u32, ResolvedCreep<u32>> = HashMap::new();
+        creeps.insert(1, mover(1, from, blocked));
+        let idle: HashMap<Position, u32> = [(blocked, 99u32)].into_iter().collect();
+
+        resolve_conflicts(&mut creeps, &idle, &|_| true, DEFAULT_MAX_SHOVE_DEPTH);
+
+        assert!(creeps[&1].resolved);
+        assert_ne!(creeps[&1].final_pos, blocked, "must not be granted the registered occupant's tile");
+        assert_ne!(creeps[&1].final_pos, from, "must sidestep (local avoidance), not stall");
+        assert_eq!(
+            creeps[&1].final_pos.get_range_to(blocked),
+            1,
+            "avoidance keeps the creep adjacent to the blocked tile so it resumes next tick"
+        );
     }
 }

@@ -46,6 +46,11 @@ pub struct StuckThresholds {
     /// Ticks immobile before increasing search max_ops (tier 2).
     pub increase_ops: u16,
     /// Ticks immobile before enabling shoving in the resolver (tier 3).
+    /// NOTE: not currently consulted — nothing calls `should_enable_shoving*`; shoving is
+    /// governed per-request via `MovementRequest.allow_shove` plus the resolver's own
+    /// priority/stuck gate (`try_shove`'s `STUCK_SHOVE_THRESHOLD`). Wiring this tier (making
+    /// shove an ESCALATION instead of a per-request default) is a recorded follow-up; doing it
+    /// silently here would change live behavior, so the field stays documented-but-inert.
     pub enable_shoving: u16,
     /// Ticks immobile before reporting failure to the job layer (tier 4).
     pub report_failure: u16,
@@ -138,6 +143,8 @@ impl StuckState {
         self.ticks_immobile >= thresholds.increase_ops
     }
 
+    /// NOTE: currently unconsulted (no MovementSystem/resolver caller) — see
+    /// `StuckThresholds::enable_shoving`.
     pub fn should_enable_shoving_with(&self, thresholds: &StuckThresholds) -> bool {
         self.ticks_immobile >= thresholds.enable_shoving
     }
@@ -329,6 +336,16 @@ pub struct MovementSystem<'a, Handle> {
     pathfinding_headroom: Option<f64>,
     /// Repaths performed this tick (reset in process(); read via tick_stats()).
     repaths_this_tick: u32,
+    /// Known stationary occupants OUTSIDE this tick's request set (position → handle), injected
+    /// via [`set_idle_creep_positions`](Self::set_idle_creep_positions) and CONSUMED (taken, so
+    /// cleared) by the next `process()`. Without it, a creep that reached its goal and left the
+    /// request set is invisible to both the optimistic first-path (`friendly_creeps: false`) and
+    /// the resolver — a later creep paths into it and burns `ticks_immobile ≥ 2` engine-rejected
+    /// intents per blocking event before the friendly-avoid repath fires (ADR 0033 §M4 finding
+    /// F2, `failed_into_parked`). Registered occupants are treated by `resolve_conflicts` as
+    /// occupied tiles: the grant path denies them and offers local avoidance, so the mover
+    /// routes around parked creeps deliberately. Default empty = the historical behavior.
+    idle_creep_positions: HashMap<Position, Handle>,
     phantom: std::marker::PhantomData<Handle>,
 }
 
@@ -375,6 +392,7 @@ where
             movement_cpu_cap: None,
             pathfinding_headroom: None,
             repaths_this_tick: 0,
+            idle_creep_positions: HashMap::new(),
             phantom: std::marker::PhantomData,
         }
     }
@@ -436,6 +454,16 @@ where
         self.stuck_thresholds = thresholds;
     }
 
+    /// Register creeps that are NOT in this tick's `MovementData` as stationary occupants
+    /// (position → handle) for the NEXT `process()` call only (consumed, then cleared — per-tick
+    /// data, like the request set). The resolver then denies grants/shove-landings/avoidance onto
+    /// their tiles and sidesteps around them, instead of optimistically issuing a move the engine
+    /// will reject (the `failed_into_parked` class, ADR 0033 §M4 F2 — see the field doc).
+    /// Not calling this preserves the historical behavior exactly (empty map).
+    pub fn set_idle_creep_positions(&mut self, positions: HashMap<Position, Handle>) {
+        self.idle_creep_positions = positions;
+    }
+
     /// Set a CPU budget for the movement system. `get_cpu` returns the
     /// current CPU usage; `budget` is the maximum CPU that may be spent on
     /// pathfinding for stuck creeps this tick. The start CPU is captured
@@ -465,13 +493,25 @@ where
     }
 
     /// Returns `true` when the movement CPU budget has been exhausted.
+    ///
+    /// `None` (no budget set) = UNLIMITED, consistent with `is_over_tick_limit` /
+    /// `is_over_movement_cap` (`is_some_and`: an absent limit never binds). SEMANTICS CHANGED
+    /// 2026-07-01: previously `is_none_or(exhausted)` — an ABSENT budget meant EXHAUSTED, so any
+    /// consumer that never called `set_cpu_budget`/`set_repath_budget` (every headless driver;
+    /// the sim-core kernel driver, hence the offline combat sim) silently ran with ALL
+    /// stuck-escalation and expiry repathing disabled: a blocked creep re-issued its rejected
+    /// move forever — the permanent-livelock class the rover-eval failed-move sentinel caught
+    /// (ADR 0033 §M4 finding F1). The live bot always sets both budgets
+    /// (ibex pathing/movementsystem.rs:269,272) and sim-core's driver sets explicit unlimited
+    /// ones, so this change only un-breaks future headless consumers.
     fn is_cpu_budget_exhausted(&self) -> bool {
-        self.cpu_budget.as_ref().is_none_or(|b| b.is_exhausted())
+        self.cpu_budget.as_ref().is_some_and(|b| b.is_exhausted())
     }
 
     /// Returns `true` when the repath budget for expiry repathing is exhausted.
+    /// `None` = UNLIMITED (see `is_cpu_budget_exhausted` for the 2026-07-01 semantics change).
     fn is_repath_budget_exhausted(&self) -> bool {
-        self.repath_budget.as_ref().is_none_or(|b| b.is_exhausted())
+        self.repath_budget.as_ref().is_some_and(|b| b.is_exhausted())
     }
 
     /// True when we have hit the tick CPU limit and should skip work for this creep.
@@ -498,6 +538,11 @@ where
         S: MovementSystemExternal<Handle>,
     {
         let mut results = MovementResults::new();
+
+        // Per-tick injected state: consume the registered idle occupants (see
+        // `set_idle_creep_positions`) so a stale registration can never leak into a later tick —
+        // taken before the early return below for the same reason.
+        let idle_creep_positions = std::mem::take(&mut self.idle_creep_positions);
 
         if data.requests.is_empty() {
             return results;
@@ -662,8 +707,6 @@ where
         }
 
         // --- Pass 2: Conflict resolution ---
-        let idle_creep_positions: HashMap<Position, Handle> = HashMap::new();
-
         if !self.is_over_tick_limit() && !self.is_over_movement_cap() {
             // Blocking-structure layer for shove/local-avoidance (IBEX-040):
             // terrain alone lets the resolver shove a creep onto a tile
@@ -1458,5 +1501,245 @@ where
 
             None => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resolver::DirectionExt;
+    use screeps::constants::Direction;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn pos(x: u8, y: u8) -> Position {
+        Position::new(
+            RoomCoordinate::new(x).unwrap(),
+            RoomCoordinate::new(y).unwrap(),
+            "W1N1".parse().unwrap(),
+        )
+    }
+
+    /// Cost source with no game data — every layer is `None`, so cost-matrix
+    /// builds degrade to terrain-only (the headless-consumer shape).
+    struct NullCostSource;
+    impl CostMatrixDataSource for NullCostSource {
+        fn get_structure_costs(&self, _r: RoomName) -> Option<StuctureCostMatrixCache> {
+            None
+        }
+        fn get_construction_site_costs(&self, _r: RoomName) -> Option<ConstructionSiteCostMatrixCache> {
+            None
+        }
+        fn get_creep_costs(&self, _r: RoomName) -> Option<CreepCostMatrixCache> {
+            None
+        }
+    }
+
+    /// Counts `search` calls and returns a straight horizontal path origin→goal (same room,
+    /// same y — the fixture worlds below keep y fixed). Open terrain everywhere.
+    struct CountingPathfinder {
+        searches: u32,
+    }
+    impl PathfindingProvider for CountingPathfinder {
+        fn search(
+            &mut self,
+            origin: Position,
+            goal: Position,
+            _range: u32,
+            _room_callback: &mut dyn FnMut(RoomName) -> Option<LocalCostMatrix>,
+            _max_ops: u32,
+            _plain_cost: u8,
+            _swamp_cost: u8,
+        ) -> PathfindingResult {
+            self.searches += 1;
+            let y = origin.y().u8();
+            let room = origin.room_name();
+            let path = (origin.x().u8() + 1..=goal.x().u8())
+                .map(|x| {
+                    Position::new(
+                        RoomCoordinate::new(x).unwrap(),
+                        RoomCoordinate::new(y).unwrap(),
+                        room,
+                    )
+                })
+                .collect();
+            PathfindingResult { path, incomplete: false }
+        }
+        fn search_many(
+            &mut self,
+            _origin: Position,
+            _goals: &[(Position, u32)],
+            _flee: bool,
+            _room_callback: &mut dyn FnMut(RoomName) -> Option<LocalCostMatrix>,
+            _max_ops: u32,
+            _plain_cost: u8,
+            _swamp_cost: u8,
+        ) -> PathfindingResult {
+            PathfindingResult { path: Vec::new(), incomplete: true }
+        }
+        fn find_route(
+            &self,
+            _from: RoomName,
+            _to: RoomName,
+            _room_callback: &dyn Fn(RoomName, RoomName) -> f64,
+        ) -> Result<Vec<RouteStep>, String> {
+            Ok(Vec::new()) // same-room fixtures: no inter-room legs
+        }
+        fn get_room_linear_distance(&self, _from: RoomName, _to: RoomName) -> u32 {
+            0
+        }
+        fn is_tile_walkable(&self, _pos: Position) -> bool {
+            true
+        }
+    }
+
+    /// Records each creep's issued `move_direction` into a shared sink (the headless analogue of
+    /// `creep.move(dir)` — same idiom as sim-core's `SimCreepHandle`).
+    struct TestCreep {
+        id: u32,
+        pos: Position,
+        sink: Rc<RefCell<HashMap<u32, Direction>>>,
+    }
+    impl CreepHandle for TestCreep {
+        fn pos(&self) -> Position {
+            self.pos
+        }
+        fn fatigue(&self) -> u32 {
+            0
+        }
+        fn spawning(&self) -> bool {
+            false
+        }
+        fn move_direction(&self, dir: Direction) -> Result<(), String> {
+            self.sink.borrow_mut().insert(self.id, dir);
+            Ok(())
+        }
+        fn pull(&self, _other: &Self) -> Result<(), String> {
+            Ok(())
+        }
+        fn move_pulled_by(&self, _other: &Self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// Fixed-position external: the creep never actually moves (the engine "rejects" every move),
+    /// which is exactly the immobile shape that must escalate through the stuck ladder.
+    struct StubExternal {
+        positions: HashMap<u32, Position>,
+        data: HashMap<u32, CreepMovementData>,
+        sink: Rc<RefCell<HashMap<u32, Direction>>>,
+    }
+    impl MovementSystemExternal<u32> for StubExternal {
+        type Creep = TestCreep;
+        fn get_creep(&self, entity: u32) -> Result<TestCreep, MovementError> {
+            let pos = *self.positions.get(&entity).ok_or("no creep".to_owned())?;
+            Ok(TestCreep { id: entity, pos, sink: self.sink.clone() })
+        }
+        fn get_creep_movement_data(&mut self, entity: u32) -> Result<&mut CreepMovementData, MovementError> {
+            Ok(self.data.entry(entity).or_default())
+        }
+        fn get_entity_position(&self, entity: u32) -> Option<Position> {
+            self.positions.get(&entity).copied()
+        }
+    }
+
+    // The three limit predicates must agree that ABSENT means "never binds" (`is_some_and`).
+    // Regression for the 2026-07-01 semantics fix: `is_none_or` made an absent budget EXHAUSTED,
+    // silently disabling stuck-escalation + expiry repathing for budget-less consumers (F1).
+    #[test]
+    fn absent_budgets_mean_unlimited_not_exhausted() {
+        let mut cache = CostMatrixCache::default();
+        let mut cms = CostMatrixSystem::new(&mut cache, Box::new(NullCostSource));
+        let mut pf = CountingPathfinder { searches: 0 };
+        let mut system: MovementSystem<'_, u32> = MovementSystem::new(&mut cms, &mut pf, None);
+
+        assert!(!system.is_cpu_budget_exhausted(), "absent CPU budget = unlimited");
+        assert!(!system.is_repath_budget_exhausted(), "absent repath budget = unlimited");
+        assert!(!system.is_over_tick_limit(), "absent tick limit = unlimited (unchanged)");
+
+        // A budget that IS set still binds: zero budget is exhausted immediately.
+        system.set_cpu_budget(|| 1.0, 0.0);
+        system.set_repath_budget(|| 1.0, 0.0);
+        assert!(system.is_cpu_budget_exhausted());
+        assert!(system.is_repath_budget_exhausted());
+    }
+
+    // End-to-end F1 regression: a permanently blocked creep, driven by a consumer that never sets
+    // any budget, must still escalate into stuck repathing. Under the old `is_none_or` semantics
+    // the pathfinder ran exactly once (the unconditional needs_path) and never again — the creep
+    // re-issued its rejected move forever (the offline permanent-livelock class).
+    #[test]
+    fn stuck_repath_fires_without_any_budget_set() {
+        let sink: Rc<RefCell<HashMap<u32, Direction>>> = Rc::new(RefCell::new(HashMap::new()));
+        let mut external = StubExternal {
+            positions: [(1u32, pos(10, 25))].into_iter().collect(),
+            data: HashMap::new(),
+            sink: sink.clone(),
+        };
+        let mut pf = CountingPathfinder { searches: 0 };
+
+        // The system is rebuilt per tick (the live shape); external + pathfinder persist.
+        for _ in 0..6 {
+            let mut cache = CostMatrixCache::default();
+            let mut cms = CostMatrixSystem::new(&mut cache, Box::new(NullCostSource));
+            let mut system = MovementSystem::new(&mut cms, &mut pf, None);
+            // Deliberately NO set_cpu_budget / set_repath_budget: the semantics under test.
+            let mut data = MovementData::new();
+            data.move_to(1u32, pos(20, 25));
+            system.process(&mut external, data);
+        }
+
+        // needs_path (tick 1) + at least one stuck repath once ticks_immobile reaches
+        // avoid_friendly_creeps (2). Old semantics: stuck at exactly 1.
+        assert!(
+            pf.searches >= 2,
+            "a budget-less consumer must still stuck-repath (searches: {})",
+            pf.searches
+        );
+    }
+
+    // F2 end-to-end at the process() seam: a parked creep registered via
+    // set_idle_creep_positions makes the resolver route AROUND it, where the unregistered
+    // baseline issues a move INTO it (the engine-rejected `failed_into_parked` intent).
+    #[test]
+    fn registered_idle_occupant_is_routed_around_not_moved_into() {
+        let parked = pos(15, 25);
+        let mover_from = pos(14, 25);
+
+        let run = |register: bool| -> Option<Position> {
+            let sink: Rc<RefCell<HashMap<u32, Direction>>> = Rc::new(RefCell::new(HashMap::new()));
+            let mut external = StubExternal {
+                positions: [(1u32, mover_from)].into_iter().collect(),
+                data: HashMap::new(),
+                sink: sink.clone(),
+            };
+            let mut cache = CostMatrixCache::default();
+            let mut cms = CostMatrixSystem::new(&mut cache, Box::new(NullCostSource));
+            let mut pf = CountingPathfinder { searches: 0 };
+            let mut system = MovementSystem::new(&mut cms, &mut pf, None);
+            if register {
+                // Handle 99 is OUTSIDE the request set — a parked (goal-reached) creep.
+                system.set_idle_creep_positions([(parked, 99u32)].into_iter().collect());
+            }
+            let mut data = MovementData::new();
+            data.move_to(1u32, pos(20, 25));
+            system.process(&mut external, data);
+
+            let dir = sink.borrow().get(&1).copied()?;
+            let off = dir.into_offset();
+            Some(pos(
+                (mover_from.x().u8() as i32 + off.0) as u8,
+                (mover_from.y().u8() as i32 + off.1) as u8,
+            ))
+        };
+
+        // Baseline (no registration): the optimistic path runs straight through the parked tile
+        // and the resolver cannot know better — the issued move targets it (engine would reject).
+        assert_eq!(run(false), Some(parked), "unregistered baseline paths into the parked tile");
+
+        // Registered: the grant is denied and local avoidance sidesteps — the issued move exists
+        // (no stall) and never targets the occupied tile.
+        let target = run(true).expect("mover must still be issued a move (sidestep), not stall");
+        assert_ne!(target, parked, "registered occupant tile must not be moved into");
     }
 }
