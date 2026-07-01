@@ -451,7 +451,34 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
         let mut winner_can_move = true;
         let mut avoidance_tile: Option<Position> = None;
 
-        if let Some(occupant) = find_occupant(tile) {
+        // A tile already CLAIMED by a resolved creep's final position — a swap member entering it
+        // (swaps resolve in Step 1 and leave the intent/occupancy maps), an earlier winner, or a
+        // shoved/avoiding creep parked onto it — is firmly taken this tick. Granting it again would
+        // emit a DOUBLE-BOOKED move-set (two own creeps issued into one tile); the engine admits
+        // exactly one (a mutual swap's rate1=100 beats any single contender), so the other intent is
+        // wasted. Deny the grant and offer the winner local avoidance, like a failed shove. (The
+        // avoidance/shove paths already honor resolved final positions via `firmly_occupied`; this
+        // closes the same hole in the grant path — found by the rover-eval failed-move sentinel.)
+        let tile_claimed = creeps.values().any(|c| c.resolved && c.final_pos == *tile);
+        if tile_claimed {
+            let winner_creep = &creeps[&winner_handle];
+            let firmly_occupied: std::collections::HashSet<Position> = creeps
+                .values()
+                .filter(|c| c.resolved)
+                .map(|c| c.final_pos)
+                .collect();
+            avoidance_tile = try_local_avoidance(
+                winner_creep.current_pos,
+                *tile,
+                &firmly_occupied,
+                &current_pos_to_entity,
+                idle_creep_positions,
+                is_tile_walkable,
+            );
+            if avoidance_tile.is_none() {
+                winner_can_move = false;
+            }
+        } else if let Some(occupant) = find_occupant(tile) {
             if occupant != winner_handle {
                 let winner_creep = &creeps[&winner_handle];
                 let shover = ShoveContext {
@@ -1015,5 +1042,40 @@ mod tests {
         // (local avoidance) and does NOT take the contested tile.
         assert_eq!(a2_lo, contested, "higher Handle must win the contested tile");
         assert_ne!(a1_lo, contested, "lower Handle must not also occupy the contested tile");
+    }
+
+    // A swap pair plus a third creep targeting the tile the swap ENTERS (the rover-eval
+    // crossing-swarm failure, root-caused 2026-07-01): swaps resolve in Step 1 and leave the
+    // intent/occupancy maps, so the grant path saw the swap-entered tile as FREE and issued a
+    // second claim on it — a double-booked move-set. The engine gives the tile to the swap member
+    // (mutual-swap rate1 = 100 beats any single contender), so the third creep's intent is
+    // rejected: one wasted intent per occurrence, live. Resolved final positions must be treated
+    // as firmly claimed by the grant path.
+    #[test]
+    fn third_creep_cannot_claim_a_swap_entered_tile() {
+        // A@(22,24) ↔ B@(21,25) swap; C@(22,25) targets (22,24) — the tile B enters.
+        let a_from = pos(22, 24);
+        let b_from = pos(21, 25);
+        let c_from = pos(22, 25);
+        let mut creeps: HashMap<u32, ResolvedCreep<u32>> = HashMap::new();
+        creeps.insert(1, mover(1, a_from, b_from));
+        creeps.insert(2, mover(2, b_from, a_from));
+        creeps.insert(3, mover(3, c_from, a_from));
+        resolve_conflicts(&mut creeps, &HashMap::new(), &|_| true, DEFAULT_MAX_SHOVE_DEPTH);
+
+        // The swap executes...
+        assert_eq!(creeps[&1].final_pos, b_from, "swap member A crosses");
+        assert_eq!(creeps[&2].final_pos, a_from, "swap member B crosses");
+        // ...and the swap-entered tile is CLAIMED: C must not be issued into it (the engine
+        // would reject it — a wasted intent). C side-steps or stays.
+        assert_ne!(
+            creeps[&3].final_pos, a_from,
+            "double-booked move-set: two creeps issued into one tile"
+        );
+        // The invariant behind it: a resolved move-set never books one tile twice.
+        let mut seen = std::collections::HashSet::new();
+        for c in creeps.values() {
+            assert!(seen.insert(c.final_pos), "duplicate final_pos {:?}", c.final_pos);
+        }
     }
 }
