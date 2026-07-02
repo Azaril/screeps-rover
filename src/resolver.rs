@@ -670,10 +670,24 @@ fn resolve_swaps<Handle: Hash + Eq + Copy + Ord>(
     creeps: &mut HashMap<Handle, ResolvedCreep<Handle>>,
 ) {
     // Build position -> entity map for moving creeps.
+    //
+    // DETERMINISM (defence-in-depth, REC-045; cf. `current_pos_to_entity` in
+    // `resolve_conflicts`): on a degenerate stacked-tile input (border stacks
+    // are the documented real trigger) a plain insert in `creeps.iter()` order
+    // keeps whichever creep the per-process HashMap seed yields LAST, so the
+    // occupant a swap-seeker resolves against — and anything downstream of it —
+    // would be seed-flaky. Build in Handle-sorted order and keep the LOWEST
+    // Handle on collision so the occupant is a pure function of the world.
     let mut pos_to_entity: HashMap<Position, Handle> = HashMap::new();
-    for (entity, creep) in creeps.iter() {
-        if creep.has_request && !creep.resolved {
-            pos_to_entity.insert(creep.current_pos, *entity);
+    {
+        let mut ordered: Vec<(Handle, Position)> = creeps
+            .iter()
+            .filter(|(_, creep)| creep.has_request && !creep.resolved)
+            .map(|(entity, creep)| (*entity, creep.current_pos))
+            .collect();
+        ordered.sort_unstable_by_key(|(entity, _)| *entity);
+        for (entity, position) in ordered {
+            pos_to_entity.entry(position).or_insert(entity);
         }
     }
 
@@ -835,11 +849,26 @@ fn try_shove<Handle: Hash + Eq + Copy + Ord>(
 
     // Build a map of current_pos -> entity for unresolved creeps (and idle
     // creeps) so we can find chain-shove candidates.
-    let mut unresolved_pos_to_entity: HashMap<Position, Handle> = creeps
-        .iter()
-        .filter(|(h, c)| !c.resolved && **h != entity)
-        .map(|(h, c)| (c.current_pos, *h))
-        .collect();
+    //
+    // DETERMINISM (defence-in-depth, REC-045; cf. `current_pos_to_entity` in
+    // `resolve_conflicts`): a plain `.collect()` on a stacked tile keeps the
+    // per-process-seed-LAST creep, so WHICH occupant gets chain-shoved — and
+    // therefore whether the whole chain succeeds — would be seed-flaky on
+    // degenerate stacked inputs (border stacks are the documented real
+    // trigger). Sorted-build, lowest Handle wins; active creeps still take
+    // precedence over idle registrations on the same tile.
+    let mut unresolved_pos_to_entity: HashMap<Position, Handle> = HashMap::new();
+    {
+        let mut ordered: Vec<(Handle, Position)> = creeps
+            .iter()
+            .filter(|(h, c)| !c.resolved && **h != entity)
+            .map(|(h, c)| (*h, c.current_pos))
+            .collect();
+        ordered.sort_unstable_by_key(|(h, _)| *h);
+        for (h, position) in ordered {
+            unresolved_pos_to_entity.entry(position).or_insert(h);
+        }
+    }
     for (pos, handle) in idle_creep_positions.iter() {
         unresolved_pos_to_entity.entry(*pos).or_insert(*handle);
     }
@@ -1214,6 +1243,104 @@ mod tests {
         for c in creeps.values() {
             assert!(seen.insert(c.final_pos), "duplicate final_pos {:?}", c.final_pos);
         }
+    }
+
+    // REC-045: the chain-shove candidate on a STACKED tile must be the LOWEST
+    // Handle. `try_shove`'s `unresolved_pos_to_entity` was a plain `.collect()`,
+    // keeping the per-process-seed-LAST creep, so on degenerate stacked inputs
+    // (border stacks are the documented live trigger) WHICH occupant the chain
+    // went through — and whether the whole shove succeeded — flipped per
+    // process. Creeps 2 (shovable) and 3 (unshovable) share the only escape
+    // tile: routing the chain through 2 (lowest) succeeds; through 3 it
+    // dead-ends and the entire shove fails.
+    #[test]
+    fn stacked_tile_chain_shove_candidate_is_the_lowest_handle() {
+        let origin = pos(10, 10);
+        let stack = pos(11, 10);
+        let landing = pos(12, 10);
+
+        let run = |low_first: bool| -> (bool, Position, Position, bool) {
+            let mut creeps: HashMap<u32, ResolvedCreep<u32>> = HashMap::new();
+            creeps.insert(1, occupant(origin));
+            let shovable = occupant(stack);
+            let mut unshovable = occupant(stack);
+            unshovable.allow_shove = false;
+            if low_first {
+                creeps.insert(2, shovable.clone());
+                creeps.insert(3, unshovable.clone());
+            } else {
+                creeps.insert(3, unshovable.clone());
+                creeps.insert(2, shovable.clone());
+            }
+            // The only walkable tiles are the stacked tile and the landing
+            // beyond it — the chain has exactly one viable route.
+            let walkable = |p: Position| -> bool { p == stack || p == landing };
+            let shover = ShoveContext {
+                priority: MovementPriority::High.anchor_value(),
+                stuck_ticks: 0,
+                stuck_shove_threshold: STUCK_SHOVE_THRESHOLD,
+            };
+            let shoved = try_shove(
+                1,
+                &mut creeps,
+                &HashMap::new(),
+                &walkable,
+                0,
+                DEFAULT_MAX_SHOVE_DEPTH,
+                shover,
+                &mut Vec::new(),
+            );
+            (shoved, creeps[&1].final_pos, creeps[&2].final_pos, creeps[&3].resolved)
+        };
+
+        let a = run(true);
+        let b = run(false);
+        assert_eq!(a, b, "stacked-tile chain outcome must be insertion-order-independent");
+
+        let (shoved, one_final, two_final, three_resolved) = a;
+        assert!(shoved, "the chain must route through the LOWEST-Handle (shovable) stack member");
+        assert_eq!(one_final, stack, "the shoved occupant advances onto the vacated stack tile");
+        assert_eq!(two_final, landing, "the lowest-Handle stack member is chain-shoved to the landing");
+        assert!(!three_resolved, "the unshovable stack member is untouched");
+    }
+
+    // REC-045 (defence-in-depth): `resolve_swaps`' position map is now built in
+    // Handle-sorted order with lowest-Handle-wins on a STACKED tile, matching
+    // `current_pos_to_entity`. Mutual-desire pair discovery is symmetric (the
+    // pair is also found from the un-stacked partner's side), so today the
+    // stacked map entry cannot flip the pair SET — this pins the end-to-end
+    // stacked-tile outcome as insertion-order-independent so any future
+    // asymmetry in discovery (e.g. an occupant-side-only gate) inherits a
+    // deterministic map instead of re-opening the seed-flake class.
+    #[test]
+    fn stacked_tile_swap_outcome_is_insertion_order_independent() {
+        let stack = pos(20, 20);
+        let across = pos(21, 20);
+        let elsewhere = pos(20, 21);
+
+        let run = |low_first: bool| -> (Position, Position, Position) {
+            let mut creeps: HashMap<u32, ResolvedCreep<u32>> = HashMap::new();
+            let one = mover(1, stack, across); // mutual-desire swap partner of 3
+            let two = mover(2, stack, elsewhere); // stacked on 1, heading away
+            let three = mover(3, across, stack);
+            if low_first {
+                creeps.insert(1, one);
+                creeps.insert(2, two);
+            } else {
+                creeps.insert(2, two);
+                creeps.insert(1, one);
+            }
+            creeps.insert(3, three);
+            resolve_conflicts(&mut creeps, &HashMap::new(), &|_| true, DEFAULT_MAX_SHOVE_DEPTH);
+            (creeps[&1].final_pos, creeps[&2].final_pos, creeps[&3].final_pos)
+        };
+
+        let a = run(true);
+        let b = run(false);
+        assert_eq!(a, b, "stacked-tile swap outcome must be insertion-order-independent");
+        assert_eq!(a.0, across, "the swap executes: creep 1 crosses");
+        assert_eq!(a.2, stack, "the swap executes: creep 3 enters the stacked tile");
+        assert_eq!(a.1, elsewhere, "the non-partner stack member proceeds on its own way");
     }
 
     // The `idle_creep_positions` registration seam (ADR 0033 §M4 F2): an occupant registered
