@@ -407,7 +407,8 @@ pub struct MovementSystem<'a, Handle> {
     /// When set, do not start pathfinding unless (used + headroom) <= max_cpu. Prevents one unbounded find_route
     /// from blowing the cap when we were just under it (e.g. at 79 CPU with cap 80, one pathfind can use 100+).
     pathfinding_headroom: Option<f64>,
-    /// Repaths performed this tick (reset in process(); read via tick_stats()).
+    /// Successful path generations this tick — every `generate_path` Ok, first-time searches
+    /// included (reset in process(); read via tick_stats(); see `MovementTickStats::repaths`).
     repaths_this_tick: u32,
     /// Known stationary occupants OUTSIDE this tick's request set (position → handle), injected
     /// via [`set_idle_creep_positions`](Self::set_idle_creep_positions) and CONSUMED (taken, so
@@ -473,8 +474,12 @@ pub struct MovementTickStats {
     pub ops_budget_cap: u32,
     /// Ops actually consumed by pathfinding this tick.
     pub ops_consumed: u32,
-    /// Paths regenerated this tick (stuck + expiry repaths; first-time
-    /// paths are not repaths).
+    /// Successful path generations this tick. NOTE: despite the name this is a SEARCH counter,
+    /// not repaths-only — first-time (`needs_path`) and segment re-searches increment it exactly
+    /// like stuck/expiry repaths (`generate_path`'s Ok arm is the single increment site; failed
+    /// searches are not counted), so `ops_consumed / repaths` ≈ ops per successful search. The
+    /// field name is pinned by its consumers (ibex's seg-57 `repath_count` stream + the
+    /// rover-eval ops bench) — the honest doc fix, ADR 0033 slice 7.
     pub repaths: u32,
 }
 
@@ -874,6 +879,42 @@ where
                             },
                         );
                     } else {
+                        // ARRIVED WITHOUT DISPLACEMENT CONSENT (static miners / no-consent holds:
+                        // `allow_shove == allow_swap == false`). Historically this arm inserted NO
+                        // `ResolvedCreep` at all, so the occupant was INVISIBLE to the resolver's
+                        // grant/avoidance/shove world — the FOURTH instance of the Pass-1
+                        // stationary-occupant hole (fatigued, border-crosser, path-error): movers
+                        // pathed into it optimistically and burned engine-rejected intents every
+                        // blocking event (ADR 0033 slice 7). Consent governs DISPLACEMENT, never
+                        // VISIBILITY: insert a pre-RESOLVED entry claiming its own tile
+                        // (`final_pos == current_pos`), so the grant path sees the tile as firmly
+                        // claimed (`tile_claimed`) — no shove attempt (nothing consents; enum
+                        // `Immovable` would refuse anyway) and no sealed-corridor optimistic push
+                        // (the occupant will not move, the push is known-doomed) — and
+                        // `resolve_conflicts` marks denials against it `denied_by_idle`, exactly
+                        // as for registered idles, so a denied mover's avoidance dance still
+                        // climbs the stuck ladder into the friendly-avoid repath that routes
+                        // around the parked tile.
+                        resolved_creeps.insert(
+                            *entity,
+                            ResolvedCreep {
+                                entity: *entity,
+                                current_pos: creep_pos,
+                                desired_pos: None,
+                                priority: request.priority,
+                                priority_value: request.effective_priority(),
+                                allow_shove: false,
+                                shove_enabled: false,
+                                shove_stuck_threshold: STUCK_SHOVE_THRESHOLD,
+                                allow_swap: false,
+                                stuck_ticks: 0,
+                                resolved: true,
+                                final_pos: creep_pos,
+                                has_request: true,
+                                denied_by_idle: false,
+                                anchor: request.anchor,
+                            },
+                        );
                         results.insert(*entity, MovementResult::Arrived);
                     }
                 }

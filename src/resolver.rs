@@ -515,6 +515,30 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
             if avoidance_tile.is_none() {
                 winner_can_move = false;
             }
+            // ARRIVED-OCCUPANT DENIAL-AS-STUCK (ADR 0033 slice 7, static-miner visibility): when
+            // the claim is Pass 1's pre-resolved ARRIVED-no-consent entry — parked on its own
+            // tile (`final == current`), no desired move, no shove/swap consent — the blocker is
+            // as permanent as a registered idle, so the denial must feed the ladder exactly like
+            // an idle denial: without the mark the winner's avoidance sidestep resets
+            // `ticks_immobile` every tick and the friendly-avoid repath that would route around
+            // the parked tile never fires (the zero-failed-intent dance-livelock class).
+            // Transient claims stay unmarked — a swap member or an earlier winner entering the
+            // tile has `current_pos != tile`, an avoidance parking lands off its own tile too,
+            // and denied movers stay unresolved until Step 4 — so ordinary traffic jams are
+            // never booked as idle denials (the `active_occupant_denial` contract below holds).
+            let parked_claimant = creeps.values().any(|c| {
+                c.resolved
+                    && c.final_pos == *tile
+                    && c.current_pos == *tile
+                    && c.desired_pos.is_none()
+                    && !c.allow_shove
+                    && !c.allow_swap
+            });
+            if parked_claimant {
+                if let Some(winner_creep) = creeps.get_mut(&winner_handle) {
+                    winner_creep.denied_by_idle = true;
+                }
+            }
         } else if let Some(occupant) = find_occupant(tile) {
             if occupant != winner_handle {
                 let winner_creep = &creeps[&winner_handle];
@@ -1371,17 +1395,22 @@ mod tests {
         assert!(creeps[&1].denied_by_idle, "idle denial (avoidance outcome) must be marked");
     }
 
-    // denied_by_idle is IDLE-specific: a denial caused by an ACTIVE (requested) occupant that
-    // refuses displacement is the normal contention path — it must NOT be marked, or every
-    // ordinary traffic jam would be booked as an idle denial.
+    // denied_by_idle is PERMANENT-BLOCKER-specific: a denial caused by a TRANSIENT active
+    // occupant that refuses displacement is the normal contention path — it must NOT be marked,
+    // or every ordinary traffic jam would be booked as an idle denial. The unresolved
+    // stationary shape here is Pass 1's `stationary_occupant` (fatigued / border-crosser /
+    // path-error — all gone within ticks). NOTE: an ARRIVED no-consent occupant is no longer
+    // this shape — Pass 1 pre-resolves it on its own tile and its denials ARE marked (it is as
+    // permanent as an idle; see `arrived_parked_claimant_denies_grant_and_marks_denied_by_idle`).
     #[test]
     fn active_occupant_denial_is_not_marked_denied_by_idle() {
         let from = pos(10, 25);
         let blocked = pos(11, 25);
         let mut creeps: HashMap<u32, ResolvedCreep<u32>> = HashMap::new();
         creeps.insert(1, mover(1, from, blocked));
-        // A stationary ACTIVE occupant (has_request: true, e.g. an arrived creep) that consents
-        // to nothing: shove fails, so the winner is denied and sidesteps.
+        // A stationary ACTIVE occupant (has_request: true, unresolved — the transient
+        // fatigued/border-crosser/path-error shape) that consents to nothing: shove fails, so
+        // the winner is denied and sidesteps.
         let mut blocker = mover(2, blocked, blocked);
         blocker.desired_pos = None;
         blocker.allow_shove = false;
@@ -1394,6 +1423,44 @@ mod tests {
         assert!(
             !creeps[&1].denied_by_idle,
             "an ACTIVE-occupant denial must not be marked as an idle denial"
+        );
+    }
+
+    // ADR 0033 slice 7 (static-miner visibility): the ARRIVED-no-consent shape Pass 1 now
+    // pre-resolves — parked on its own tile, no desired move, no shove/swap consent. The grant
+    // path must (a) never grant its tile (it is firmly claimed — `tile_claimed`), (b) never
+    // displace it, and (c) mark the denied winner `denied_by_idle` so the avoidance dance feeds
+    // the stuck ladder into the friendly-avoid repath (as for registered idles — the blocker is
+    // just as permanent).
+    #[test]
+    fn arrived_parked_claimant_denies_grant_and_marks_denied_by_idle() {
+        let from = pos(10, 25);
+        let blocked = pos(11, 25);
+        let mut creeps: HashMap<u32, ResolvedCreep<u32>> = HashMap::new();
+        creeps.insert(1, mover(1, from, blocked));
+        // The Pass-1 arrived-no-consent entry (a static miner holding at `Immovable`).
+        let mut miner = mover(2, blocked, blocked);
+        miner.desired_pos = None;
+        miner.priority = MovementPriority::Immovable;
+        miner.priority_value = MovementPriority::Immovable.anchor_value();
+        miner.allow_shove = false;
+        miner.shove_enabled = false;
+        miner.allow_swap = false;
+        miner.resolved = true;
+        miner.final_pos = blocked;
+        creeps.insert(2, miner);
+
+        resolve_conflicts(&mut creeps, &HashMap::new(), &|_| true, DEFAULT_MAX_SHOVE_DEPTH);
+
+        assert_eq!(creeps[&2].final_pos, blocked, "the arrived occupant is never displaced");
+        assert_ne!(
+            creeps[&1].final_pos, blocked,
+            "the winner must not be granted the arrived occupant's tile (a doomed intent)"
+        );
+        assert_ne!(creeps[&1].final_pos, from, "the winner sidesteps (local avoidance), not stalls");
+        assert!(
+            creeps[&1].denied_by_idle,
+            "an arrived-parked denial must feed denial-as-stuck, exactly like an idle denial"
         );
     }
 
