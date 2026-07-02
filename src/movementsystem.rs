@@ -374,6 +374,49 @@ pub struct MovementSystem<'a, Handle> {
     phantom: std::marker::PhantomData<Handle>,
 }
 
+/// A stationary, non-displaceable occupancy entry for a REQUESTED creep that must not be issued
+/// any move intent this tick, but still occupies its tile through the whole movement phase:
+///
+/// - **fatigued / spawning** — the engine's `canMove` (movement.js) disqualifies a creep with
+///   nonzero tick-start fatigue (only a pull bypasses it), so its own move AND any shove/swap
+///   move planned for it would be dropped;
+/// - **border-crossing** — a creep standing on an exit tile whose next path step is the adjacent
+///   room's mirror tile: the cross is NOT a move (the engine drops an off-edge move intent at
+///   registration, `move.js:32`) — the unconditional end-of-tick edge relocation
+///   (`creeps/tick.js`) carries it across for free.
+///
+/// Either way the creep stays on its tile through movement resolution, so it must remain VISIBLE
+/// to `resolve_conflicts` as a stationary occupant: the grant, avoidance, and shove paths all
+/// treat its tile as taken. Dropping it from the resolver's world (the historical behavior for
+/// both shapes) let the resolver plan other creeps straight through its tile and issue the
+/// doomed cross-step itself — the two engine-rejected-intent classes the rover-eval failed-move
+/// sentinel caught at room borders and on heavy-fatigue swamp routes (ADR 0033 M5, 2026-07-01).
+fn stationary_occupant<Handle: Hash + Eq + Copy>(
+    entity: Handle,
+    creep_pos: Position,
+    request: &MovementRequest<Handle>,
+) -> ResolvedCreep<Handle> {
+    ResolvedCreep {
+        entity,
+        current_pos: creep_pos,
+        desired_pos: None,
+        priority: request.priority,
+        priority_value: request.effective_priority(),
+        // Not displaceable THIS tick: a shove/swap move issued for it is engine-dropped by
+        // construction (fatigue gate / the relocation already owns the crosser's tick).
+        allow_shove: false,
+        shove_enabled: false,
+        shove_stuck_threshold: STUCK_SHOVE_THRESHOLD,
+        allow_swap: false,
+        stuck_ticks: 0,
+        resolved: false,
+        final_pos: creep_pos,
+        has_request: true,
+        denied_by_idle: false,
+        anchor: request.anchor,
+    }
+}
+
 /// Per-tick movement telemetry, read after `process()` (host telemetry
 /// consumers — e.g. ibex's seg-57 metrics block).
 #[derive(Debug, Clone, Copy, Default)]
@@ -628,7 +671,14 @@ where
             let creep_pos = creep.pos();
 
             if creep.fatigue() > 0 || creep.spawning() {
+                // Cannot execute any move this tick, but still occupies its tile through the
+                // movement phase — keep it visible to the resolver as a stationary occupant
+                // (see `stationary_occupant`: skipping it entirely made its tile invisible to
+                // the grant/avoidance/shove paths, so the resolver planned other creeps
+                // straight through it and the engine rejected every such intent — the
+                // rover-eval swamp-contention `failed_coordination` class).
                 leader_moves.insert(*entity, (creep_pos, None));
+                resolved_creeps.insert(*entity, stationary_occupant(*entity, creep_pos, request));
                 results.insert(*entity, MovementResult::Moving);
                 continue;
             }
@@ -691,6 +741,20 @@ where
             };
 
             match desired_result {
+                // The next path step crosses a room border: the creep is standing on an exit
+                // tile and the step is the adjacent room's mirror tile. That is NOT a move —
+                // the engine drops an off-edge move intent at registration (`move.js:32`) and
+                // instead relocates ANY creep standing on an exit tile at end of tick
+                // (`creeps/tick.js`, unconditional — movement not required). Issuing the
+                // outward step burned one guaranteed-rejected intent every tick a blocked
+                // crosser bounced on the seam (the rover-eval border-wide `failed_wall`
+                // class). Model it as a stationary occupant instead: it blocks its tile
+                // through the movement phase, and the relocation does the cross for free.
+                Ok(Some(desired_pos)) if desired_pos.room_name() != creep_pos.room_name() => {
+                    leader_moves.insert(*entity, (creep_pos, None));
+                    resolved_creeps.insert(*entity, stationary_occupant(*entity, creep_pos, request));
+                    results.insert(*entity, MovementResult::Moving);
+                }
                 Ok(Some(desired_pos)) => {
                     leader_moves.insert(*entity, (creep_pos, Some(desired_pos)));
                     let creep_data = external.get_creep_movement_data(*entity).ok();
@@ -789,6 +853,14 @@ where
                 .collect();
             idle_entries.sort_unstable_by_key(|(p, _)| (p.room_name(), p.x().u8(), p.y().u8()));
             for (pos, entity) in idle_entries {
+                // Displacement consent requires the idle to be able to EXECUTE the evacuation
+                // move this tick: a fatigued (or spawning) idle's issued move is engine-dropped
+                // (`canMove`), which would also doom the shover's move into the tile — the same
+                // wasted-intent pair the fatigued-requested fix above closes.
+                let displaceable = external
+                    .get_creep(entity)
+                    .map(|c| c.fatigue() == 0 && !c.spawning())
+                    .unwrap_or(false);
                 resolved_creeps.entry(entity).or_insert_with(|| ResolvedCreep {
                     entity,
                     current_pos: pos,
@@ -797,7 +869,7 @@ where
                     priority_value: MovementPriority::Low.anchor_value(),
                     // A parked creep consents to displacement (any mover with a real
                     // priority outranks the Low anchor); it never initiates shoves.
-                    allow_shove: true,
+                    allow_shove: displaceable,
                     shove_enabled: false,
                     shove_stuck_threshold: STUCK_SHOVE_THRESHOLD,
                     allow_swap: false,

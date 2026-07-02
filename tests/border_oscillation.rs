@@ -5,14 +5,21 @@
 //! `MovementSystemExternal`, across a multi-room `MoveTo`. Each tick we:
 //!   1. build a `MoveTo` request and run `process`,
 //!   2. capture the chosen `move_direction` the system emitted,
-//!   3. apply that direction to the creep position with `Position::checked_add`
-//!      — which is EXACTLY the game's border teleport: moving off an exit tile
-//!      (x/y == 0/49) lands on the mirror entrance tile of the adjacent room.
+//!   3. apply engine-faithful move semantics: the step executes only WITHIN the
+//!      0..49 room grid — the engine DROPS an off-edge move intent at
+//!      registration (`move.js:32`; the harness panics on one, since issuing it
+//!      is a guaranteed-wasted intent — the border-wide `failed_wall` class the
+//!      rover-eval sentinel caught) — and then the end-of-tick edge relocation
+//!      (`creeps/tick.js`, unconditional) carries any creep standing on an exit
+//!      tile to the adjacent room's mirror tile. THAT relocation is the border
+//!      cross; it is not a move. (The harness originally applied the chosen
+//!      direction with `Position::checked_add`, the RTS model where the outward
+//!      intent itself crosses — which hid exactly this wasted-intent class.)
 //!
 //! The per-tick trace prints (tick, room, x, y, chosen_next, repathed?, result)
-//! and the test asserts NO position is ever revisited (an oscillation = the
-//! creep steps back onto a tile it already occupied, in particular bouncing
-//! across the border between two adjacent rooms).
+//! and the tests assert the creep ARRIVES and NO position is ever revisited (an
+//! oscillation = the creep steps back onto a tile it already occupied, in
+//! particular bouncing across the border between two adjacent rooms).
 //!
 //! Run with:
 //!   cargo test -p screeps-rover --test border_oscillation -- --nocapture
@@ -114,6 +121,20 @@ fn pos(x: u8, y: u8, room: &str) -> Position {
     )
 }
 
+/// (dx, dy) for a direction (Screeps y grows downward, so `Top` is −y).
+fn dir_offset(dir: Direction) -> (i32, i32) {
+    match dir {
+        Direction::Top => (0, -1),
+        Direction::TopRight => (1, -1),
+        Direction::Right => (1, 0),
+        Direction::BottomRight => (1, 1),
+        Direction::Bottom => (0, 1),
+        Direction::BottomLeft => (-1, 1),
+        Direction::Left => (-1, 0),
+        Direction::TopLeft => (-1, -1),
+    }
+}
+
 /// Drive the movement system tick by tick, applying the game's border-teleport
 /// move semantics, and return the per-tick trace.
 fn run_trace(origin: Position, destination: Position, range: u32, max_ticks: usize) -> Vec<Position> {
@@ -199,24 +220,59 @@ fn run_trace_full(
         let before = external.creep.pos;
         let chosen = *last_move.borrow();
 
-        // Apply the move exactly as the game does: applying a Direction offset
-        // to an exit-tile Position crosses the border to the mirror entrance
-        // tile of the adjacent room (Position::checked_add is world-coordinate
-        // aware).
-        let after = match chosen {
+        // Apply the move exactly as the engine does. Phase 1 — the move intent
+        // executes only WITHIN the room grid; an off-edge step is dropped at
+        // registration (`move.js:32`), so issuing one is a guaranteed-wasted
+        // intent and the harness fails loudly on it.
+        let moved = match chosen {
             Some(dir) => {
-                let stepped = before.checked_add_direction(dir).unwrap_or(before);
-                // If we crossed a vertical (E/W) border, optionally skew the
-                // landing y to model a mirror-tile placement mismatch.
-                if teleport_y_skew != 0 && stepped.room_name() != before.room_name() {
-                    stepped
-                        .checked_add((0, teleport_y_skew))
-                        .unwrap_or(stepped)
-                } else {
-                    stepped
-                }
+                let (dx, dy) = dir_offset(dir);
+                let nx = before.x().u8() as i32 + dx;
+                let ny = before.y().u8() as i32 + dy;
+                assert!(
+                    (0..=49).contains(&nx) && (0..=49).contains(&ny),
+                    "off-grid move intent issued from ({}, {}) {} dir {:?} — the engine drops \
+                     this (move.js:32); the cross is the edge relocation, never a move",
+                    before.x().u8(),
+                    before.y().u8(),
+                    before.room_name(),
+                    dir
+                );
+                Position::new(
+                    RoomCoordinate::new(nx as u8).unwrap(),
+                    RoomCoordinate::new(ny as u8).unwrap(),
+                    before.room_name(),
+                )
             }
             None => before,
+        };
+        // Phase 2 — end-of-tick edge relocation (`creeps/tick.js`, unconditional):
+        // a creep standing on an exit tile crosses to the adjacent room's mirror
+        // tile, whether or not it moved this tick. This is the border cross.
+        let (x, y) = (moved.x().u8(), moved.y().u8());
+        let exit_offset = if x == 0 {
+            Some((-1i32, 0i32))
+        } else if y == 0 {
+            Some((0, -1))
+        } else if x == 49 {
+            Some((1, 0))
+        } else if y == 49 {
+            Some((0, 1))
+        } else {
+            None
+        };
+        let after = match exit_offset {
+            Some(offset) => {
+                let crossed = moved.checked_add(offset).unwrap_or(moved);
+                // Optionally skew the landing y to model a mirror-tile placement
+                // mismatch (path planned a different entrance tile).
+                if teleport_y_skew != 0 && crossed.room_name() != moved.room_name() {
+                    crossed.checked_add((0, teleport_y_skew)).unwrap_or(crossed)
+                } else {
+                    crossed
+                }
+            }
+            None => moved,
         };
         external.creep.pos = after;
 
@@ -257,6 +313,21 @@ fn run_trace_full(
 /// occupied. Consecutive-duplicate positions (a stationary tick — stuck, or
 /// idling at the destination after arrival) are collapsed first, so only real
 /// back-steps count. Returns (index-in-collapsed-trace, position) if any.
+/// The creep must actually ARRIVE: under the engine-faithful move model a creep that stops
+/// issuing intents on the seam (or never crosses) parks forever, which the no-revisit check
+/// alone cannot catch (stationary ticks are collapsed as non-oscillation).
+fn assert_arrived(trace: &[Position], destination: Position) {
+    let last = trace.last().copied().expect("non-empty trace");
+    assert_eq!(
+        last.get_range_to(destination),
+        0,
+        "creep must arrive at {:?}, ended at {:?} after {} ticks",
+        (destination.x().u8(), destination.y().u8(), destination.room_name().to_string()),
+        (last.x().u8(), last.y().u8(), last.room_name().to_string()),
+        trace.len() - 1
+    );
+}
+
 fn first_revisit(trace: &[Position]) -> Option<(usize, Position)> {
     // Collapse consecutive duplicates (stationary ticks are not oscillation).
     let mut moves: Vec<Position> = Vec::new();
@@ -287,6 +358,7 @@ fn border_crossing_west_to_east_center_row() {
     let origin = pos(3, 25, "W1N1");
     let destination = pos(46, 25, "W2N1");
     let trace = run_trace(origin, destination, 0, 200);
+    assert_arrived(&trace, destination);
 
     let revisit = first_revisit(&trace);
     if let Some((i, p)) = revisit {
@@ -313,6 +385,7 @@ fn border_crossing_west_to_east_one_room() {
     let origin = pos(46, 10, "W1N1");
     let destination = pos(3, 10, "W0N1");
     let trace = run_trace(origin, destination, 0, 120);
+    assert_arrived(&trace, destination);
 
     if let Some((i, p)) = first_revisit(&trace) {
         panic!(
@@ -335,6 +408,7 @@ fn border_crossing_mirror_tile_mismatch() {
     let origin = pos(3, 25, "W1N1");
     let destination = pos(46, 25, "W2N1");
     let trace = run_trace_full(origin, destination, 0, 200, false, 1);
+    assert_arrived(&trace, destination);
 
     if let Some((i, p)) = first_revisit(&trace) {
         panic!(
@@ -360,6 +434,7 @@ fn border_crossing_force_repath_every_tick() {
     let origin = pos(3, 25, "W1N1");
     let destination = pos(46, 25, "W2N1");
     let trace = run_trace_opts(origin, destination, 0, 200, true);
+    assert_arrived(&trace, destination);
 
     if let Some((i, p)) = first_revisit(&trace) {
         panic!(
