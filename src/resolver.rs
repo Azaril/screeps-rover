@@ -537,7 +537,14 @@ pub(crate) fn resolve_conflicts<Handle: Hash + Eq + Copy + Ord>(
                         0,
                         max_shove_depth,
                         shover,
-                    );
+                        &mut Vec::new(),
+                    )
+                    // Post-recursion re-check: the shove chain may have landed a DEEP member back
+                    // onto the winner's target tile after the occupant vacated it (try_shove's
+                    // frame snapshots go stale across recursion — see its staleness warning).
+                    // Granting anyway double-books the move-set; treat as a failed shove so the
+                    // winner takes avoidance instead.
+                    && !creeps.values().any(|c| c.resolved && c.final_pos == *tile);
                 if !shoved {
                     // Shove was denied (likely priority gate). Before giving up
                     // and leaving the winner stuck, try local avoidance: find an
@@ -756,6 +763,15 @@ fn resolve_swaps<Handle: Hash + Eq + Copy + Ord>(
 ///
 /// Supports chain-shoving: if all adjacent tiles are occupied, it will
 /// recursively attempt to shove occupants up to `max_shove_depth` levels deep.
+///
+/// `freed_tiles` is the stack of tiles being VACATED by the active chain — every chain member's
+/// `current_pos`, each promised to its caller (the winner enters the first, each chain link
+/// enters the next). No deeper member may land on any of them: doing so re-occupies a tile
+/// already promised away, which the post-recursion re-checks would only catch LATE (failing the
+/// whole chain — a wasted shove, and under contention a wasted engine intent). Forbidding them
+/// up front lets the chain pick a different landing and succeed. The caller passes an empty
+/// stack; recursion pushes/pops around its own frame.
+#[allow(clippy::too_many_arguments)]
 fn try_shove<Handle: Hash + Eq + Copy + Ord>(
     entity: Handle,
     creeps: &mut HashMap<Handle, ResolvedCreep<Handle>>,
@@ -764,6 +780,7 @@ fn try_shove<Handle: Hash + Eq + Copy + Ord>(
     depth: u32,
     max_shove_depth: u32,
     shover: ShoveContext,
+    freed_tiles: &mut Vec<Position>,
 ) -> bool {
     if depth >= max_shove_depth {
         return false;
@@ -795,10 +812,21 @@ fn try_shove<Handle: Hash + Eq + Copy + Ord>(
     }
 
     let pos = creep.current_pos;
+    // This frame's tile joins the chain's freed set: the caller enters it this tick, so no
+    // deeper member may land back on it (see the `freed_tiles` doc). Popped before every return.
+    freed_tiles.push(pos);
 
     // Build set of positions that are definitively occupied (resolved creeps'
     // final positions). We don't include unresolved creeps' current_pos here
     // because those tiles may be freed if we chain-shove their occupants.
+    //
+    // STALENESS WARNING: this is a FRAME-ENTRY snapshot. Every chain-shove recursion below can
+    // resolve more creeps — including onto a tile this frame is about to take (a deep chain
+    // member lands on the just-vacated desired/neighbor tile). Every ASSIGNMENT below therefore
+    // re-validates against live resolved finals (`is_claimed_now`) after any recursion; trusting
+    // the snapshot alone issued DOUBLE-BOOKED move-sets (two own creeps into one tile — the
+    // engine admits one, wastes the other intent, and chain-blocks its followers; the rover-eval
+    // dense-crowd probe caught this at the shared pinch, 2026-07-01).
     let firmly_occupied: std::collections::HashSet<Position> = creeps
         .values()
         .filter(|c| c.resolved)
@@ -824,6 +852,7 @@ fn try_shove<Handle: Hash + Eq + Copy + Ord>(
         if desired != creep.current_pos
             && is_tile_walkable(desired)
             && !firmly_occupied.contains(&desired)
+            && !freed_tiles.contains(&desired)
         {
             // Respect anchor constraint.
             let anchor_ok = creep
@@ -844,15 +873,24 @@ fn try_shove<Handle: Hash + Eq + Copy + Ord>(
                             depth + 1,
                             max_shove_depth,
                             shover,
+                            freed_tiles,
                         )
                     } else {
                         true
                     };
 
-                if tile_free {
+                // Post-recursion re-check (defence-in-depth behind the freed-tiles forbid): the
+                // chain may have landed a DEEP member on this very tile (the frame snapshot is
+                // stale — see the staleness warning above). Taking it anyway double-books the
+                // move-set.
+                let claimed_now = creeps
+                    .values()
+                    .any(|c| c.resolved && c.final_pos == desired);
+                if tile_free && !claimed_now {
                     let creep = creeps.get_mut(&entity).unwrap();
                     creep.resolved = true;
                     creep.final_pos = desired;
+                    freed_tiles.pop();
                     return true;
                 }
             }
@@ -884,6 +922,11 @@ fn try_shove<Handle: Hash + Eq + Copy + Ord>(
             continue;
         }
 
+        // Being vacated by the active chain — promised to its caller (see `freed_tiles`).
+        if freed_tiles.contains(&neighbor) {
+            continue;
+        }
+
         // Respect anchor constraint: only shove to tiles within anchor range.
         if let Some(anchor) = creep.anchor {
             if neighbor.get_range_to(anchor.position) > anchor.range {
@@ -902,19 +945,30 @@ fn try_shove<Handle: Hash + Eq + Copy + Ord>(
                 depth + 1,
                 max_shove_depth,
                 shover,
+                freed_tiles,
             );
             if !chain_shoved {
                 continue; // Can't free this tile, try next direction.
             }
         }
 
+        // Post-recursion re-check (defence-in-depth behind the freed-tiles forbid — see the
+        // staleness warning above): any recursion this frame ran — this direction's chain OR the
+        // failed desired-branch chain — may have resolved a creep onto `neighbor` since the frame
+        // snapshot was taken. Landing here anyway double-books the move-set.
+        if creeps.values().any(|c| c.resolved && c.final_pos == neighbor) {
+            continue;
+        }
+
         // Tile is free (either empty or just freed by chain-shove). Shove here.
         let creep = creeps.get_mut(&entity).unwrap();
         creep.resolved = true;
         creep.final_pos = neighbor;
+        freed_tiles.pop();
         return true;
     }
 
+    freed_tiles.pop();
     false
 }
 
@@ -995,6 +1049,7 @@ mod tests {
             0,
             DEFAULT_MAX_SHOVE_DEPTH,
             shover,
+            &mut Vec::new(),
         );
 
         assert!(shoved);
@@ -1023,6 +1078,7 @@ mod tests {
             0,
             DEFAULT_MAX_SHOVE_DEPTH,
             shover,
+            &mut Vec::new(),
         );
 
         assert!(!shoved);

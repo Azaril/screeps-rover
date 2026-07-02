@@ -20,6 +20,13 @@ const MAX_PATHFIND_OPS: u32 = 20_000;
 /// Default per-tick pathfinding ops budget (20 CPU). Enforced so movement cannot exhaust the tick.
 const DEFAULT_PATHFIND_OPS_BUDGET: u32 = 20_000;
 
+/// The share of the per-tick pathfinding ops pool RESERVED for first-path (`needs_path`)
+/// searches, as a divisor of the cap (5 → the last 20% of the pool). OPTIONAL searches — stuck
+/// and expiry repaths, where the creep still holds a usable path — are skipped once the
+/// remaining pool falls into the reserve, so a creep with NO path (which cannot move at all)
+/// always finds real search budget. See the reserve note at `should_pathfind`.
+const NEEDS_PATH_OPS_RESERVE_DIV: u32 = 5;
+
 /// Default ticks a cached path is followed before an expiry repath — i.e. PATH COMMITMENT.
 /// TUNED 5 → 20 by the screeps-rover-eval parameter tournament (ADR 0033 §D5.4, 2026-07-01):
 /// with 5, a creep whose stuck-escalation found a detour re-optimized back onto the blocked
@@ -82,7 +89,10 @@ pub struct StuckState {
     pub ticks_immobile: u16,
     /// How many consecutive ticks distance to target hasn't decreased.
     pub ticks_no_progress: u16,
-    /// How many times we've regenerated the path for the current destination.
+    /// Search attempts (successful or failed) this STUCK EPISODE — reset on real progress. The
+    /// exponent of the storm-damper backoff (`should_stuck_repath_with`); previously a
+    /// written-never-read per-destination counter (IBEX-016 flagged exactly this repurposing:
+    /// cap/space repaths so a failed search cannot re-fire every tick).
     pub repath_count: u8,
     /// Distance to target last tick (for progress tracking).
     #[serde(default)]
@@ -91,10 +101,16 @@ pub struct StuckState {
     /// occupant (avoidance sidestep, stay, or the sealed-corridor push) — consumed by the next
     /// tick's path-progress accounting, which then records IMMOBILE even if the creep physically
     /// moved (denial-as-stuck, ADR 0033 M5: the avoidance dance must feed the escalation
-    /// ladder). Additive `#[serde(default)]` field (the `last_distance` precedent) — old
-    /// serialized state deserializes with `false`.
+    /// ladder). NOTE: `#[serde(default)]` is forward-compat only — for positional consumers
+    /// (screeps-ibex persists this struct via bincode in the world save) an appended field is
+    /// still a shape change; ibex bumped WORLD_FORMAT_VERSION to 24 for this field and
+    /// `ticks_since_repath` below (reconciliation REC-001).
     #[serde(default)]
     pub denied_by_idle: bool,
+    /// Ticks since the last `generate_path` attempt (successful or failed) — the storm damper's
+    /// clock (`should_stuck_repath_with`). Additive `#[serde(default)]`.
+    #[serde(default)]
+    pub ticks_since_repath: u16,
 }
 
 impl StuckState {
@@ -105,14 +121,19 @@ impl StuckState {
         self.repath_count = 0;
         self.last_distance = 0;
         self.denied_by_idle = false;
+        self.ticks_since_repath = 0;
     }
 
     /// Record that the creep moved this tick.
     pub fn record_moved(&mut self, current_distance: u32) {
         self.ticks_immobile = 0;
+        self.ticks_since_repath = self.ticks_since_repath.saturating_add(1);
 
         if current_distance < self.last_distance {
             self.ticks_no_progress = 0;
+            // Real progress ends the stuck episode: the backoff exponent re-arms so the NEXT
+            // jam gets a fast first response (see `should_stuck_repath_with`).
+            self.repath_count = 0;
         } else {
             self.ticks_no_progress += 1;
         }
@@ -124,6 +145,7 @@ impl StuckState {
     pub fn record_immobile(&mut self, current_distance: u32) {
         self.ticks_immobile += 1;
         self.ticks_no_progress += 1;
+        self.ticks_since_repath = self.ticks_since_repath.saturating_add(1);
         self.last_distance = current_distance;
     }
 
@@ -184,6 +206,32 @@ impl StuckState {
     pub fn needs_repath_with(&self, thresholds: &StuckThresholds) -> bool {
         self.ticks_immobile >= thresholds.avoid_friendly_creeps
             || self.should_repath_no_progress_with(thresholds)
+    }
+
+    /// The stuck-repath STORM DAMPER (the ADR 0004 repath-storm / CPU-death-spiral class,
+    /// IBEX-016). INSIDE the designed escalation window (`ticks_immobile ≤ report_failure`) the
+    /// historical every-tick cadence stands: successive searches carry NEW options as the tiers
+    /// flip (friendly-avoid → all-friendly → more ops), and coordination-heavy movement relies on
+    /// the fast recovery (the combat drain-soak bed regressed to RosterWiped under earlier
+    /// damping — the adjudicated evidence). PAST tier 4 the ladder has nothing new to offer, so a
+    /// long jam's every-tick searches are pure waste: spacing starts at the tier-1 threshold and
+    /// doubles with each attempt this episode (`repath_count`, reset on real progress; ×16
+    /// shift cap, 64-tick ceiling). In a real jam the world changes slowly and waiting IS the
+    /// answer: re-searching every immobile tick let a dense crowd (rover-eval `shared_pinch`,
+    /// N ≥ 40) saturate the entire per-tick pathfinding ops pool indefinitely, starving path-LESS
+    /// creeps into doomed dreg-budget searches forever — the wedge nuclei of the dense-crowd
+    /// livelock. Per-request by construction: both the window edge and the base come from the
+    /// request's own `StuckThresholds` (the split-defaults mechanism).
+    pub fn should_stuck_repath_with(&self, thresholds: &StuckThresholds) -> bool {
+        if !self.needs_repath_with(thresholds) {
+            return false;
+        }
+        if self.ticks_immobile <= thresholds.report_failure {
+            return true;
+        }
+        let base = thresholds.avoid_friendly_creeps.max(1) as u32;
+        let spacing = (base << self.repath_count.min(4)).min(64) as u16;
+        self.ticks_since_repath >= spacing
     }
 }
 
@@ -587,8 +635,8 @@ where
     /// stuck-escalation and expiry repathing disabled: a blocked creep re-issued its rejected
     /// move forever — the permanent-livelock class the rover-eval failed-move sentinel caught
     /// (ADR 0033 §M4 finding F1). The live bot always sets both budgets
-    /// (ibex pathing/movementsystem.rs:269,272) and sim-core's driver sets explicit unlimited
-    /// ones, so this change only un-breaks future headless consumers.
+    /// (ibex `MovementUpdateSystem` in pathing/movementsystem.rs) and sim-core's driver sets
+    /// explicit unlimited ones, so this change only un-breaks future headless consumers.
     fn is_cpu_budget_exhausted(&self) -> bool {
         self.cpu_budget.as_ref().is_some_and(|b| b.is_exhausted())
     }
@@ -830,7 +878,16 @@ where
                     }
                 }
                 Err(err) => {
+                    // A live requested creep whose next step could not be computed (typically
+                    // `PathNotFound` under per-tick ops-budget exhaustion) still OCCUPIES its
+                    // tile through the movement phase — the third instance of the Pass-1
+                    // occupancy hole (fatigued, border-crosser, now path-error): dropped from
+                    // the resolver's world, it was an invisible immovable post the resolver
+                    // granted other creeps through, and the engine rejected every such intent
+                    // (the dense-crowd `failed_coordination` flood — pathless creeps were the
+                    // wedge nuclei of the N≥40 pinch livelock).
                     leader_moves.insert(*entity, (creep_pos, None));
+                    resolved_creeps.insert(*entity, stationary_occupant(*entity, creep_pos, request));
                     results.insert(*entity, MovementResult::Failed(err));
                 }
             }
@@ -1237,7 +1294,7 @@ where
             .unwrap_or(false);
         let stuck_needs_repath = stuck_state_snapshot
             .as_ref()
-            .map(|s| s.needs_repath_with(self.thresholds_for(request)))
+            .map(|s| s.should_stuck_repath_with(self.thresholds_for(request)))
             .unwrap_or(false);
         let stuck_state_for_gen = stuck_state_snapshot.unwrap_or_default();
 
@@ -1259,11 +1316,22 @@ where
         // When pathfinding is skipped for budget reasons, the path timer
         // resets so the creep continues on its existing path without
         // re-triggering on the very next tick.
+        //
+        // FIRST-PATH POOL RESERVE: repaths (stuck + expiry) are OPTIONAL work — the creep still
+        // holds a usable path — while a `needs_path` creep cannot move AT ALL without a search.
+        // Skipping optional searches once the remaining per-tick ops pool drops into the reserve
+        // guarantees first-paths always find real budget. Without it a dense stuck crowd's
+        // repaths drained the pool to dregs every tick and mid-order first-path searches ran
+        // budget-incomplete FOREVER (permanently pathless, permanently immobile — the wedge
+        // nuclei of the rover-eval dense-crowd livelock, ADR 0004's death-spiral class).
+        let reserve = self.pathfinding_ops_budget_cap / NEEDS_PATH_OPS_RESERVE_DIV;
+        let pool_reserved = self.pathfinding_ops_budget_remaining <= reserve;
         let should_pathfind = if needs_path {
             true
         } else if stuck_needs_repath {
-            if self.is_cpu_budget_exhausted() {
-                // CPU budget exhausted: skip stuck repath, keep existing path.
+            if self.is_cpu_budget_exhausted() || pool_reserved {
+                // CPU budget exhausted (or the pool is down to the first-path reserve): skip
+                // the stuck repath, keep the existing path.
                 if let Ok(creep_data) = external.get_creep_movement_data(entity) {
                     if let Some(path_data) = creep_data.path_data.as_mut() {
                         path_data.time = 0;
@@ -1274,9 +1342,9 @@ where
                 true
             }
         } else if path_expired {
-            if self.is_cpu_budget_exhausted() || self.is_repath_budget_exhausted() {
-                // CPU budget or repath budget exhausted: skip expiry repath,
-                // reset timer and keep existing path.
+            if self.is_cpu_budget_exhausted() || self.is_repath_budget_exhausted() || pool_reserved {
+                // CPU budget or repath budget exhausted (or the pool is down to the first-path
+                // reserve): skip expiry repath, reset timer and keep existing path.
                 if let Ok(creep_data) = external.get_creep_movement_data(entity) {
                     if let Some(path_data) = creep_data.path_data.as_mut() {
                         path_data.time = 0;
@@ -1306,6 +1374,7 @@ where
 
                     let mut new_stuck_state = stuck_state_for_gen.clone();
                     new_stuck_state.repath_count = new_stuck_state.repath_count.saturating_add(1);
+                    new_stuck_state.ticks_since_repath = 0; // the damper clock re-arms per attempt
                     self.repaths_this_tick = self.repaths_this_tick.saturating_add(1);
 
                     creep_data.path_data = Some(CreepPathData {
@@ -1330,10 +1399,16 @@ where
                     //
                     // Reset the path timer so we don't immediately re-attempt a
                     // doomed repath on the very next tick. The stuck timer still
-                    // advances, so escalation (shove/swap) continues normally.
+                    // advances, so escalation (shove/swap) continues normally. The
+                    // FAILED attempt also arms the storm damper (clock + episode
+                    // count) — a doomed search must back off, not re-fire every tick
+                    // (the dense-crowd ops-saturation class).
                     if let Ok(creep_data) = external.get_creep_movement_data(entity) {
                         if let Some(path_data) = creep_data.path_data.as_mut() {
                             path_data.time = 0;
+                            path_data.stuck_state.ticks_since_repath = 0;
+                            path_data.stuck_state.repath_count =
+                                path_data.stuck_state.repath_count.saturating_add(1);
                         }
                     }
                 }
