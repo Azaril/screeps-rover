@@ -44,8 +44,18 @@ const DEFAULT_REUSE_PATH_LENGTH: u32 = 20;
 /// might have lower thresholds for faster reaction).
 #[derive(Clone, Debug)]
 pub struct StuckThresholds {
+    /// Ticks immobile before a STUCK REPATH fires at all — the escalation ladder's CADENCE gate
+    /// (`needs_repath_with`, and the storm damper's spacing base). Historically this was one
+    /// field with `avoid_friendly_creeps`, so the repath cadence and the tier-1 friendly-avoid
+    /// REPRICING could only move together — which blocked per-request ladders that keep the fast
+    /// cadence but never detour around squadmates (the combat engaged-member ladder, ADR 0033
+    /// slice 7 follow-up: an engaged member's stuck repaths keep firing on the default cadence
+    /// while pricing the same squadmate-transparent matrix as its first path). The default
+    /// equals the tier-1 default, so an unsplit ladder is byte-identical to the old coupling.
+    pub stuck_repath: u16,
     /// Ticks immobile before avoiding *nearby* friendly creeps in pathfinding (tier 1).
-    /// Only creeps within `friendly_creep_distance` rooms are avoided.
+    /// Only creeps within `friendly_creep_distance` rooms are avoided. Repricing only — the
+    /// repath cadence itself is `stuck_repath` (decoupled; see there).
     pub avoid_friendly_creeps: u16,
     /// Ticks immobile before avoiding *all* friendly creeps regardless of
     /// distance (tier 1b). Escalation from the proximity-limited tier.
@@ -71,6 +81,7 @@ pub struct StuckThresholds {
 impl Default for StuckThresholds {
     fn default() -> Self {
         StuckThresholds {
+            stuck_repath: 2,
             avoid_friendly_creeps: 2,
             avoid_all_friendly_creeps: 4,
             increase_ops: 5,
@@ -204,7 +215,7 @@ impl StuckState {
     }
 
     pub fn needs_repath_with(&self, thresholds: &StuckThresholds) -> bool {
-        self.ticks_immobile >= thresholds.avoid_friendly_creeps
+        self.ticks_immobile >= thresholds.stuck_repath
             || self.should_repath_no_progress_with(thresholds)
     }
 
@@ -214,9 +225,9 @@ impl StuckState {
     /// flip (friendly-avoid → all-friendly → more ops), and coordination-heavy movement relies on
     /// the fast recovery (the combat drain-soak bed regressed to RosterWiped under earlier
     /// damping — the adjudicated evidence). PAST tier 4 the ladder has nothing new to offer, so a
-    /// long jam's every-tick searches are pure waste: spacing starts at the tier-1 threshold and
-    /// doubles with each attempt this episode (`repath_count`, reset on real progress; ×16
-    /// shift cap, 64-tick ceiling). In a real jam the world changes slowly and waiting IS the
+    /// long jam's every-tick searches are pure waste: spacing starts at the cadence threshold
+    /// (`stuck_repath`) and doubles with each attempt this episode (`repath_count`, reset on
+    /// real progress; ×16 shift cap, 64-tick ceiling). In a real jam the world changes slowly and waiting IS the
     /// answer: re-searching every immobile tick let a dense crowd (rover-eval `shared_pinch`,
     /// N ≥ 40) saturate the entire per-tick pathfinding ops pool indefinitely, starving path-LESS
     /// creeps into doomed dreg-budget searches forever — the wedge nuclei of the dense-crowd
@@ -229,7 +240,7 @@ impl StuckState {
         if self.ticks_immobile <= thresholds.report_failure {
             return true;
         }
-        let base = thresholds.avoid_friendly_creeps.max(1) as u32;
+        let base = thresholds.stuck_repath.max(1) as u32;
         let spacing = (base << self.repath_count.min(4)).min(64) as u16;
         self.ticks_since_repath >= spacing
     }
@@ -2142,6 +2153,7 @@ mod tests {
         let mut pf = CountingPathfinder { searches: 0, origins: Vec::new() };
 
         let slow_ladder = StuckThresholds {
+            stuck_repath: 6,
             avoid_friendly_creeps: 6,
             avoid_all_friendly_creeps: 8,
             increase_ops: 10,
@@ -2327,5 +2339,41 @@ mod tests {
             "an idle-denied 'advance' must ACCRUE immobility (would reset to 0 without the flag)"
         );
         assert!(!state.denied_by_idle, "the flag is one tick's worth — consumed");
+    }
+
+    // CADENCE/REPRICING DECOUPLING (`StuckThresholds::stuck_repath`, ADR 0033 slice 7
+    // follow-up): a ladder may keep the fast repath cadence while pushing the friendly-avoid
+    // REPRICING tiers out of reach — the combat engaged-member shape. The stuck repath must
+    // still fire on the cadence (needs_repath / the damper), and the tier-1/1b repricing
+    // checks must stay cold, so the escalated search prices the same friendly-transparent
+    // matrix as the first path.
+    #[test]
+    fn stuck_repath_cadence_is_decoupled_from_friendly_avoid_repricing() {
+        let engaged = StuckThresholds {
+            avoid_friendly_creeps: u16::MAX,
+            avoid_all_friendly_creeps: u16::MAX,
+            ..StuckThresholds::default()
+        };
+        let state = StuckState {
+            ticks_immobile: 3, // past the default cadence (2), nowhere near u16::MAX
+            ..Default::default()
+        };
+        assert!(
+            state.needs_repath_with(&engaged),
+            "the repath cadence (stuck_repath = 2) fires independently of the repricing tiers"
+        );
+        assert!(
+            state.should_stuck_repath_with(&engaged),
+            "inside the escalation window the cadence stands"
+        );
+        assert!(
+            !state.should_avoid_friendly_creeps_with(&engaged)
+                && !state.should_avoid_all_friendly_creeps_with(&engaged),
+            "the friendly-avoid REPRICING never fires under the engaged ladder"
+        );
+        // The historical coupling is intact for an unsplit ladder: cadence == tier 1 == 2.
+        let default = StuckThresholds::default();
+        assert_eq!(default.stuck_repath, default.avoid_friendly_creeps);
+        assert!(state.needs_repath_with(&default) && state.should_avoid_friendly_creeps_with(&default));
     }
 }
