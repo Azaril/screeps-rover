@@ -114,6 +114,90 @@ fn try_local_avoidance<Handle: Hash + Eq + Copy>(
     best.map(|(pos, _)| pos)
 }
 
+/// Spawn keep-clear DISPLACEMENT (resolution-time): for each request-less idle occupant sitting
+/// within range 1 of an `eviction_point`, assign a desired step to a free walkable tile at range
+/// `>= 2` from EVERY eviction point — one tile out of the ring. The occupant's own (idle) intent is
+/// preserved; [`resolve_conflicts`] (called next) arbitrates the outward step against real movers
+/// and Pass 3 executes it. A spawn about to place a newly-spawned creep — which is not a mover and
+/// cannot shove for itself — thus keeps a free adjacent tile at completion. Best-effort: an occupant
+/// with no free outward tile stays put (like a shove that finds no landing tile).
+///
+/// Only a request-less, shoveable, not-yet-moving, non-`Immovable` occupant is displaced — never a
+/// creep carrying its own intent, and never an in-formation (`Immovable`) fighter. Deterministic:
+/// occupants are processed in `Handle` order and each takes the lowest-`(x, y)` qualifying tile,
+/// with a running `claimed` set so two evictees never target the same tile.
+pub(crate) fn apply_eviction<Handle: Hash + Eq + Copy + Ord>(
+    creeps: &mut HashMap<Handle, ResolvedCreep<Handle>>,
+    eviction_points: &[Position],
+    is_tile_walkable: &dyn Fn(Position) -> bool,
+) {
+    if eviction_points.is_empty() {
+        return;
+    }
+    // Never displace onto a currently-occupied tile or one another mover already wants.
+    let occupied: std::collections::HashSet<Position> = creeps.values().map(|c| c.current_pos).collect();
+    let mut claimed: std::collections::HashSet<Position> =
+        creeps.values().filter_map(|c| c.desired_pos).collect();
+
+    let mut ids: Vec<Handle> = creeps.keys().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        let pos = match creeps.get(&id) {
+            Some(c)
+                if c.allow_shove
+                    && !c.has_request
+                    && c.desired_pos.is_none()
+                    && !c.resolved
+                    && c.priority != MovementPriority::Immovable =>
+            {
+                c.current_pos
+            }
+            _ => continue,
+        };
+        // Only occupants actually standing on an eviction ring.
+        if !eviction_points.iter().any(|e| pos.get_range_to(*e) <= 1) {
+            continue;
+        }
+        // The lowest-(x, y) free neighbour that is clear of EVERY ring (one step out).
+        let mut best: Option<Position> = None;
+        for direction in Direction::iter() {
+            let offset = direction.into_offset();
+            let nx = pos.x().u8() as i32 + offset.0;
+            let ny = pos.y().u8() as i32 + offset.1;
+            if !(1..=48).contains(&nx) || !(1..=48).contains(&ny) {
+                continue;
+            }
+            let candidate = Position::new(
+                RoomCoordinate::new(nx as u8).unwrap(),
+                RoomCoordinate::new(ny as u8).unwrap(),
+                pos.room_name(),
+            );
+            if !eviction_points.iter().all(|e| candidate.get_range_to(*e) >= 2) {
+                continue;
+            }
+            if !is_tile_walkable(candidate) || occupied.contains(&candidate) || claimed.contains(&candidate) {
+                continue;
+            }
+            let better = match best {
+                Some(b) => (candidate.x().u8(), candidate.y().u8()) < (b.x().u8(), b.y().u8()),
+                None => true,
+            };
+            if better {
+                best = Some(candidate);
+            }
+        }
+        if let Some(target) = best {
+            claimed.insert(target);
+            if let Some(c) = creeps.get_mut(&id) {
+                c.desired_pos = Some(target);
+                // Low so the outward step still yields to any real mover contending the same tile.
+                c.priority = MovementPriority::Low;
+                c.priority_value = MovementPriority::Low.anchor_value();
+            }
+        }
+    }
+}
+
 /// Tracks per-creep state during a single tick of resolution.
 #[derive(Clone)]
 pub(crate) struct ResolvedCreep<Handle: Hash + Eq + Copy> {
@@ -1493,5 +1577,62 @@ mod tests {
         resolve_conflicts(&mut creeps, &HashMap::new(), &|_| true, DEFAULT_MAX_SHOVE_DEPTH);
         assert_eq!(creeps[&1].final_pos, contested, "a 1.5M numeric bid must beat enum Normal");
         assert_ne!(creeps[&2].final_pos, contested, "plain Normal loses to the numeric bidder");
+    }
+
+    // ── Spawn keep-clear eviction (apply_eviction) ────────────────────────────────────────────
+
+    #[test]
+    fn eviction_steps_a_ring_occupant_one_tile_out() {
+        // Spawn at (25,25); an idle occupant sits on its ring at (25,26).
+        let spawn = pos(25, 25);
+        let mut creeps: HashMap<u32, ResolvedCreep<u32>> = HashMap::new();
+        creeps.insert(1, occupant(pos(25, 26)));
+
+        apply_eviction(&mut creeps, &[spawn], &|_| true);
+
+        // It is assigned a desired step OUT of the ring: the lowest-(x,y) free neighbour at range
+        // >= 2 from the spawn — (24,27).
+        assert_eq!(creeps[&1].desired_pos, Some(pos(24, 27)));
+        assert!(creeps[&1].desired_pos.unwrap().get_range_to(spawn) >= 2, "stepped out of the ring");
+    }
+
+    #[test]
+    fn eviction_ignores_movers_immovable_and_off_ring() {
+        let spawn = pos(25, 25);
+        let mut creeps: HashMap<u32, ResolvedCreep<u32>> = HashMap::new();
+        // 1: a MOVER on the ring (has its own intent) — untouched.
+        let mut mover = occupant(pos(25, 26));
+        mover.has_request = true;
+        creeps.insert(1, mover);
+        // 2: an IMMOVABLE hold on the ring (in-formation fighter) — untouched.
+        let mut immovable = occupant(pos(26, 25));
+        immovable.priority = MovementPriority::Immovable;
+        creeps.insert(2, immovable);
+        // 3: an idle OFF the ring (range 2) — untouched.
+        creeps.insert(3, occupant(pos(25, 27)));
+
+        apply_eviction(&mut creeps, &[spawn], &|_| true);
+
+        assert_eq!(creeps[&1].desired_pos, None, "a mover keeps its own intent");
+        assert_eq!(creeps[&2].desired_pos, None, "an Immovable hold is never displaced");
+        assert_eq!(creeps[&3].desired_pos, None, "an off-ring idle is left alone");
+    }
+
+    #[test]
+    fn eviction_is_a_noop_without_points() {
+        let mut creeps: HashMap<u32, ResolvedCreep<u32>> = HashMap::new();
+        creeps.insert(1, occupant(pos(25, 26)));
+        apply_eviction(&mut creeps, &[], &|_| true);
+        assert_eq!(creeps[&1].desired_pos, None, "no eviction points = historical behaviour");
+    }
+
+    #[test]
+    fn eviction_stays_put_when_boxed_in() {
+        // Every outward tile is blocked → best-effort: no move (never onto a blocked tile).
+        let spawn = pos(25, 25);
+        let mut creeps: HashMap<u32, ResolvedCreep<u32>> = HashMap::new();
+        creeps.insert(1, occupant(pos(25, 26)));
+        apply_eviction(&mut creeps, &[spawn], &|_| false);
+        assert_eq!(creeps[&1].desired_pos, None, "no free outward tile → stays put");
     }
 }

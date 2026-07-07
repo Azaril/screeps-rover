@@ -431,6 +431,16 @@ pub struct MovementSystem<'a, Handle> {
     /// occupied tiles: the grant path denies them and offers local avoidance, so the mover
     /// routes around parked creeps deliberately. Default empty = the historical behavior.
     idle_creep_positions: HashMap<Position, Handle>,
+    /// Eviction points (spawn keep-clear): positions whose immediate range-1 ring must be kept
+    /// clear for the tick, set via [`set_eviction_points`](Self::set_eviction_points) and CONSUMED
+    /// (taken) by the next `process()`. A creep BEING spawned is not a mover and cannot shove, so a
+    /// spawn about to place a newly-spawned creep has no way to make room — if idle occupants ring
+    /// it, the creep can't be placed and the spawn stalls. For each request-less idle occupant
+    /// sitting within range 1 of an eviction point, `process` synthesizes a low-priority
+    /// `flee(range 2)` so it steps one tile out, guaranteeing a free adjacent tile at spawn
+    /// completion. Movers (real requests) and `Immovable` holds (never registered as idle) are
+    /// untouched. Default empty = the historical behavior (no eviction).
+    eviction_points: Vec<Position>,
     phantom: std::marker::PhantomData<Handle>,
 }
 
@@ -526,6 +536,7 @@ where
             pathfinding_headroom: None,
             repaths_this_tick: 0,
             idle_creep_positions: HashMap::new(),
+            eviction_points: Vec::new(),
             phantom: std::marker::PhantomData,
         }
     }
@@ -613,6 +624,17 @@ where
         self.idle_creep_positions = positions;
     }
 
+    /// Register the eviction points for this tick (spawn keep-clear — see the [`eviction_points`]
+    /// field). Each position's immediate range-1 ring is kept clear: any request-less idle occupant
+    /// within range 1 is synthesized a low-priority `flee(range 2)` so it steps one tile out,
+    /// guaranteeing a spawn a free adjacent tile when it places a newly-spawned creep (which cannot
+    /// shove for itself). CONSUMED (taken) by the next `process()`. Empty = historical behavior.
+    ///
+    /// [`eviction_points`]: Self::eviction_points
+    pub fn set_eviction_points(&mut self, points: Vec<Position>) {
+        self.eviction_points = points;
+    }
+
     /// Set a CPU budget for the movement system. `get_cpu` returns the
     /// current CPU usage; `budget` is the maximum CPU that may be spent on
     /// pathfinding for stuck creeps this tick. The start CPU is captured
@@ -692,6 +714,11 @@ where
         // `set_idle_creep_positions`) so a stale registration can never leak into a later tick —
         // taken before the early return below for the same reason.
         let idle_creep_positions = std::mem::take(&mut self.idle_creep_positions);
+        // Eviction points (spawn keep-clear) — consumed per tick like the idle set. Applied as a
+        // resolution-time DISPLACEMENT below (Pass 2), never as a synthesized creep request: the
+        // occupant's own (idle) intent is preserved and the resolver relocates it one tile out of
+        // the ring, exactly as a shove would. See the `eviction_points` field doc.
+        let eviction_points = std::mem::take(&mut self.eviction_points);
 
         if data.requests.is_empty() {
             return results;
@@ -1038,6 +1065,13 @@ where
                     .map(|matrix| matrix.get(pos.xy()) < u8::MAX)
                     .unwrap_or(true)
             };
+
+            // Spawn keep-clear DISPLACEMENT (resolution-time; see the `eviction_points` field): give
+            // each request-less idle occupant sitting on an eviction-point ring a desired step one
+            // tile OUT of the ring, so the resolver relocates it (like a shove) while its own idle
+            // intent is preserved — the creep's job never had this move fabricated for it. Runs
+            // before conflict resolution so the outward steps arbitrate against real movers normally.
+            apply_eviction(&mut resolved_creeps, &eviction_points, &is_tile_walkable);
 
             resolve_conflicts(
                 &mut resolved_creeps,
