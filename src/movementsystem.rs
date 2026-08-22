@@ -92,6 +92,24 @@ impl Default for StuckThresholds {
     }
 }
 
+impl StuckThresholds {
+    /// The ENGAGED/anchored combat-mover ladder (ADR 0033 slice-7 heal-cluster fix): stuck repaths
+    /// keep the default cadence but NEVER price a friendly-avoid detour — in a tight formation the
+    /// correct response to "stuck behind a squadmate" is the resolver's lane (hold / shove / swap /
+    /// denial-as-stuck) plus the squad brain re-deciding next tick, not a path AROUND the
+    /// heal-the-focus cluster (measured: the focused member's received heal fell ~800 → ~300/t when
+    /// engaged members detoured). Travellers keep [`Self::default`] — for a long-haul mover,
+    /// detouring around parked idles is exactly right. ONE implementation: the sim
+    /// (`screeps-combat-agent`) and the live bot both take the ladder from here (review D9).
+    pub fn engaged() -> Self {
+        StuckThresholds {
+            avoid_friendly_creeps: u16::MAX,
+            avoid_all_friendly_creeps: u16::MAX,
+            ..Self::default()
+        }
+    }
+}
+
 /// Tiered stuck detection state. Tracks both immobility (creep didn't move)
 /// and lack of progress (distance to target isn't decreasing).
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -1675,7 +1693,15 @@ where
             cost_matrix_options.swamp_cost,
         );
 
-        if result.incomplete || result.path.is_empty() {
+        // D10 (combat review §1): an INCOMPLETE flee search still carries the best-effort first
+        // step AWAY from the threats — flee mode maximizes distance, so an ops-capped partial
+        // result is a valid (if shorter) retreat. Discarding it as `PathNotFound` froze a
+        // retreating creep in place under exactly the swarm pressure that makes the search
+        // expensive — the worst possible flee outcome. Any distance gained beats standing still;
+        // only a genuinely EMPTY path (nowhere to go at all) is a failure. Move-TOWARD searches
+        // keep incomplete-is-failure (`generate_path` below): a partial path toward a goal can
+        // dead-end short of it — that asymmetry is the point.
+        if result.path.is_empty() {
             return Err(MovementFailure::PathNotFound);
         }
 
@@ -1898,6 +1924,99 @@ mod tests {
     use crate::resolver::DirectionExt;
     use screeps::constants::Direction;
     use std::cell::RefCell;
+
+    /// D10 pin (combat review §1): an ops-capped (INCOMPLETE) flee search whose partial path still
+    /// gains distance must MOVE the creep, not freeze it as `PathNotFound`. The mock returns
+    /// `incomplete: true` with a one-step path away from the threat — under the old semantics the
+    /// creep issued no move at all (the swarm-freeze), which is exactly when flee matters most.
+    #[test]
+    fn incomplete_flee_uses_the_partial_path_instead_of_freezing() {
+        struct PartialFleePathfinder;
+        impl PathfindingProvider for PartialFleePathfinder {
+            fn search(
+                &mut self,
+                _origin: Position,
+                _goal: Position,
+                _range: u32,
+                _room_callback: &mut dyn FnMut(RoomName) -> Option<LocalCostMatrix>,
+                _max_ops: u32,
+                _plain_cost: u8,
+                _swamp_cost: u8,
+            ) -> PathfindingResult {
+                PathfindingResult { path: Vec::new(), incomplete: true }
+            }
+            fn search_many(
+                &mut self,
+                origin: Position,
+                _goals: &[(Position, u32)],
+                flee: bool,
+                _room_callback: &mut dyn FnMut(RoomName) -> Option<LocalCostMatrix>,
+                _max_ops: u32,
+                _plain_cost: u8,
+                _swamp_cost: u8,
+            ) -> PathfindingResult {
+                assert!(flee, "flee requests must search in flee mode");
+                // One best-effort step away from the threat, then the ops cap hit.
+                let step = Position::new(
+                    RoomCoordinate::new(origin.x().u8() + 1).unwrap(),
+                    origin.y(),
+                    origin.room_name(),
+                );
+                PathfindingResult { path: vec![step], incomplete: true }
+            }
+            fn find_route(
+                &self,
+                _from: RoomName,
+                _to: RoomName,
+                _room_callback: &dyn Fn(RoomName, RoomName) -> f64,
+            ) -> Result<Vec<RouteStep>, String> {
+                Ok(Vec::new())
+            }
+            fn get_room_linear_distance(&self, _from: RoomName, _to: RoomName) -> u32 {
+                0
+            }
+            fn is_tile_walkable(&self, _pos: Position) -> bool {
+                true
+            }
+        }
+
+        let sink: Rc<RefCell<HashMap<u32, Direction>>> = Rc::new(RefCell::new(HashMap::new()));
+        let mut external = StubExternal {
+            positions: [(1u32, pos(10, 25))].into_iter().collect(),
+            data: HashMap::new(),
+            sink: sink.clone(),
+        };
+        let mut pf = PartialFleePathfinder;
+        let mut cache = CostMatrixCache::default();
+        let mut cms = CostMatrixSystem::new(&mut cache, Box::new(NullCostSource));
+        let mut system = MovementSystem::new(&mut cms, &mut pf, None);
+        let mut data = MovementData::new();
+        // Threat right next to the creep: flee with a wide radius forces real pathfinding.
+        data.flee(1u32, vec![FleeTarget { pos: pos(9, 25), range: 5 }]);
+        system.process(&mut external, data);
+
+        assert!(
+            sink.borrow().contains_key(&1),
+            "the partial flee path's first step must be ISSUED — a freezing retreat is the D10 regression"
+        );
+    }
+
+    /// D9 pin (combat review §1): the shared engaged ladder is squadmate-TRANSPARENT (both
+    /// friendly-avoid tiers unreachable) while every other rung — repath cadence, ops, shove,
+    /// failure reporting — stays at the default. If the transparency or the cadence coupling
+    /// regresses, engaged members detour around their own heal cluster again.
+    #[test]
+    fn engaged_ladder_is_squadmate_transparent_at_default_cadence() {
+        let e = StuckThresholds::engaged();
+        let d = StuckThresholds::default();
+        assert_eq!(e.avoid_friendly_creeps, u16::MAX, "tier-1 friendly-avoid never fires");
+        assert_eq!(e.avoid_all_friendly_creeps, u16::MAX, "tier-2 friendly-avoid never fires");
+        assert_eq!(e.stuck_repath, d.stuck_repath, "repath CADENCE stays default (the decoupling that enabled this ladder)");
+        assert_eq!(e.increase_ops, d.increase_ops);
+        assert_eq!(e.enable_shoving, d.enable_shoving, "shove stays reachable — the resolver's lane is the answer");
+        assert_eq!(e.report_failure, d.report_failure);
+        assert_eq!(e.no_progress_repath, d.no_progress_repath);
+    }
     use std::rc::Rc;
 
     fn pos(x: u8, y: u8) -> Position {
