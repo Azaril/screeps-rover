@@ -95,6 +95,13 @@ impl Default for LinearCostMatrix {
 }
 
 impl LinearCostMatrix {
+    /// Append every entry of `other` after this matrix's own entries. Apply order is
+    /// insertion order (later `set`s win under SET-apply), so `a.merge_from(&b)` makes `b`'s
+    /// entries authoritative over `a`'s on shared tiles — the seam a cost OVERLAY uses to add
+    /// soft costs UNDER an inner source's hard blockers (threat-weighted traversal, ADR 0024).
+    pub fn merge_from(&mut self, other: &LinearCostMatrix) {
+        self.data.extend(other.data.iter().copied());
+    }
     pub fn new() -> LinearCostMatrix {
         LinearCostMatrix { data: Vec::new() }
     }
