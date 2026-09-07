@@ -17,8 +17,17 @@ pub enum MovementResult {
 /// Reason why movement failed for a creep.
 #[derive(Clone, Debug)]
 pub enum MovementFailure {
-    /// `pathfinder::search` returned an incomplete path.
+    /// `pathfinder::search` ran with its full natural budget and still returned an incomplete
+    /// path (or, for flee, an empty one): the target is unreachable as far as this search can
+    /// tell. The creep holds its tile as an immovable post this tick.
     PathNotFound,
+    /// The search could NOT run, or could not complete, within THIS TICK's pathfinding budget
+    /// (per-tick ops pool drained, CPU cap / tick limit / headroom refusal). Says nothing about
+    /// reachability — a retry next tick may succeed — so the creep is NOT posted as an immovable
+    /// occupant: it stays shoveable/swappable per its request this tick, and the movement
+    /// system's first-path rotation serves it before the creeps already served. Consumers
+    /// should treat it as transient (not evidence of an unreachable target).
+    PathBudgetExhausted,
     /// Stuck for too long (exceeded threshold).
     StuckTimeout { ticks: u16 },
     /// Target is in a blocked/hostile room.

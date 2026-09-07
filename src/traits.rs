@@ -62,6 +62,14 @@ pub trait PathfindingProvider {
 pub struct PathfindingResult {
     pub path: Vec<Position>,
     pub incomplete: bool,
+    /// Ops the search ACTUALLY consumed, as reported by the provider (the engine's
+    /// `SearchResults.ops`; the headless pathfinder's settled-tile count). The movement system
+    /// RESERVES `max_ops` from its per-tick ops pool before a search and refunds
+    /// `max_ops - ops` afterwards, so the pool bounds real search CPU, not the search COUNT — a
+    /// reservation-only pool capped searches at ~10/tick regardless of cost and starved every
+    /// later first-path search into `PathNotFound` (the 2026-09-07 MMO movement wedge, ADR 0033
+    /// design delta). A provider that cannot measure reports `0` (= full refund).
+    pub ops: u32,
 }
 
 /// A step in a room-level route.

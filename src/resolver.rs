@@ -243,10 +243,14 @@ pub(crate) struct ResolvedCreep<Handle: Hash + Eq + Copy> {
 }
 
 /// Topologically sorts entities based on follow dependencies.
-/// Returns (sorted order, set of entities whose follow was broken into MoveTo).
+/// Returns (topological LAYERS — leaders before followers, each layer Handle-sorted ascending —
+/// and the set of entities whose follow was broken into MoveTo). Layers are returned
+/// separately (not flattened) so the caller can rotate the processing order WITHIN a layer
+/// (the first-path round-robin, `MovementSystem::set_first_path_cursor`) without ever placing a
+/// follower ahead of its leader.
 pub(crate) fn topological_sort_follows<Handle: Hash + Eq + Copy + Ord>(
     requests: &HashMap<Handle, MovementRequest<Handle>>,
-) -> (Vec<Handle>, HashMap<Handle, Handle>) {
+) -> (Vec<Vec<Handle>>, HashMap<Handle, Handle>) {
     // Build adjacency: follower -> leader
     let mut follow_edges: HashMap<Handle, Handle> = HashMap::new();
 
@@ -307,7 +311,7 @@ pub(crate) fn topological_sort_follows<Handle: Hash + Eq + Copy + Ord>(
     // Now do the actual topological sort (leaders before followers).
     // A leader has no follow edge (or its edge was broken).
     // We process in reverse dependency order: leaders first.
-    let mut sorted = Vec::with_capacity(requests.len());
+    let mut sorted: Vec<Vec<Handle>> = Vec::new();
     let mut remaining: HashMap<Handle, Option<Handle>> = HashMap::new();
 
     for (entity, _) in requests.iter() {
@@ -343,9 +347,11 @@ pub(crate) fn topological_sort_follows<Handle: Hash + Eq + Copy + Ord>(
             // the fallback order is seed-independent (else `remaining.iter()` is HashMap-seed order).
             let mut leftover: Vec<Handle> = remaining.keys().copied().filter(|e| !processed.contains(e)).collect();
             leftover.sort_unstable();
-            for entity in leftover {
-                sorted.push(entity);
-                processed.insert(entity);
+            for entity in &leftover {
+                processed.insert(*entity);
+            }
+            if !leftover.is_empty() {
+                sorted.push(leftover);
             }
             break;
         }
@@ -357,9 +363,9 @@ pub(crate) fn topological_sort_follows<Handle: Hash + Eq + Copy + Ord>(
         // level by Handle to make it deterministic (preserving the leaders-before-followers invariant).
         batch.sort_unstable();
         for entity in &batch {
-            sorted.push(*entity);
             processed.insert(*entity);
         }
+        sorted.push(batch);
 
         if processed.len() == remaining.len() {
             break;

@@ -74,6 +74,7 @@ impl PathfindingProvider for ScreepsPathfinder {
         PathfindingResult {
             path: result.path(),
             incomplete: result.incomplete(),
+            ops: result.ops(),
         }
     }
 
@@ -113,6 +114,7 @@ impl PathfindingProvider for ScreepsPathfinder {
         PathfindingResult {
             path: result.path(),
             incomplete: result.incomplete(),
+            ops: result.ops(),
         }
     }
 

@@ -439,6 +439,19 @@ pub struct MovementSystem<'a, Handle> {
     /// Successful path generations this tick — every `generate_path` Ok, first-time searches
     /// included (reset in process(); read via tick_stats(); see `MovementTickStats::repaths`).
     repaths_this_tick: u32,
+    /// FIRST-PATH ROUND-ROBIN cursor: the last `needs_path` creep whose first-path search was
+    /// actually SERVED (ran with its full natural budget, or completed) — set by the host from
+    /// the previous tick's [`first_path_cursor`](Self::first_path_cursor) via
+    /// [`set_first_path_cursor`](Self::set_first_path_cursor), advanced during `process()`.
+    /// Each topological layer of Pass 1 is rotated to start at the first handle AFTER the
+    /// cursor, so under a saturated ops pool the pool is handed to a DIFFERENT window of
+    /// pathless creeps each tick and every one of N such creeps is served within ⌈N/k⌉ ticks
+    /// (k = searches the pool affords). Without it the Handle-sorted order served the same
+    /// head-of-list creeps every tick and the tail re-reserved, missed, and re-entered
+    /// `needs_path` forever (the 2026-09-07 MMO wedge). A per-tick ORDERING seed, not a latch:
+    /// nothing is cooled down or suppressed — the pool is still spent on the best available
+    /// searches each tick. `None` (never set) = the historical Handle-sorted order exactly.
+    first_path_cursor: Option<Handle>,
     /// Known stationary occupants OUTSIDE this tick's request set (position → handle), injected
     /// via [`set_idle_creep_positions`](Self::set_idle_creep_positions) and CONSUMED (taken, so
     /// cleared) by the next `process()`. Without it, a creep that reached its goal and left the
@@ -505,6 +518,41 @@ fn stationary_occupant<Handle: Hash + Eq + Copy>(
     }
 }
 
+/// A stationary occupancy entry for a REQUESTED creep whose first-path search could not run
+/// within THIS tick's pathfinding budget (`MovementFailure::PathBudgetExhausted`). It has no
+/// step to issue, so it holds its tile like [`stationary_occupant`] — but it is NOT undisplaceable:
+/// nothing about the engine prevents it from executing a shove/swap move (it is not fatigued,
+/// not crossing), and its request's displacement consent stands. Posting a budget miss as an
+/// unshoveable occupant is what turned a transient pool miss into a permanent post: a hauler
+/// froze ADJACENT to the extensions it was delivering to, every creep routed through it hit an
+/// immovable wall, and the wedge only cleared when the post died of TTL (the 2026-09-07 MMO
+/// collapse, ADR 0033 design delta). A genuinely unreachable target (`PathNotFound`) keeps the
+/// [`stationary_occupant`] semantics — that creep is not going anywhere this tick either way.
+fn budget_missed_occupant<Handle: Hash + Eq + Copy>(
+    entity: Handle,
+    creep_pos: Position,
+    request: &MovementRequest<Handle>,
+) -> ResolvedCreep<Handle> {
+    ResolvedCreep {
+        entity,
+        current_pos: creep_pos,
+        desired_pos: None,
+        priority: request.priority,
+        priority_value: request.effective_priority(),
+        allow_shove: request.allow_shove,
+        // No desired tile ⇒ never initiates a shove; the shover-side fields are inert.
+        shove_enabled: false,
+        shove_stuck_threshold: STUCK_SHOVE_THRESHOLD,
+        allow_swap: request.allow_swap,
+        stuck_ticks: 0,
+        resolved: false,
+        final_pos: creep_pos,
+        has_request: true,
+        denied_by_idle: false,
+        anchor: request.anchor,
+    }
+}
+
 /// Per-tick movement telemetry, read after `process()` (host telemetry
 /// consumers — e.g. ibex's seg-57 metrics block).
 #[derive(Debug, Clone, Copy, Default)]
@@ -553,6 +601,7 @@ where
             movement_cpu_cap: None,
             pathfinding_headroom: None,
             repaths_this_tick: 0,
+            first_path_cursor: None,
             idle_creep_positions: HashMap::new(),
             eviction_points: Vec::new(),
             phantom: std::marker::PhantomData,
@@ -575,6 +624,22 @@ where
     /// for all pathfinding this tick. Applies to every pathfinding call including first-time paths.
     pub fn set_pathfinding_ops_budget(&mut self, ops: u32) {
         self.pathfinding_ops_budget_cap = ops;
+    }
+
+    /// Seed the first-path round-robin (see the `first_path_cursor` field): pass the value
+    /// [`first_path_cursor`](Self::first_path_cursor) returned after the previous tick's
+    /// `process()`. The host owns the tick-to-tick hand-off (ephemeral heap state — a VM reset
+    /// restarts the rotation from the lowest handle, nothing serialized). `None` = the
+    /// historical Handle-sorted order.
+    pub fn set_first_path_cursor(&mut self, cursor: Option<Handle>) {
+        self.first_path_cursor = cursor;
+    }
+
+    /// The last `needs_path` creep SERVED by the most recent `process()` (or the seeded value if
+    /// no first-path search was served this tick) — feed it back next tick via
+    /// [`set_first_path_cursor`](Self::set_first_path_cursor).
+    pub fn first_path_cursor(&self) -> Option<Handle> {
+        self.first_path_cursor
     }
 
     /// Per-tick telemetry for the LAST `process()` call.
@@ -747,7 +812,22 @@ where
         self.repaths_this_tick = 0;
 
         // --- Pass 0: Dependency analysis for Follow intents ---
-        let (sorted_entities, broken_follows) = topological_sort_follows(&data.requests);
+        let (layers, broken_follows) = topological_sort_follows(&data.requests);
+
+        // FIRST-PATH ROUND-ROBIN (see the `first_path_cursor` field): rotate each Handle-sorted
+        // topological layer to start at the first handle after the seeded cursor, wrapping. The
+        // leaders-before-followers invariant is untouched (rotation is WITHIN a layer), and with
+        // no cursor the order is byte-identical to the historical flat sort.
+        let sorted_entities: Vec<Handle> = layers
+            .into_iter()
+            .flat_map(|mut layer| {
+                if let Some(cursor) = self.first_path_cursor {
+                    let split = layer.partition_point(|h| *h <= cursor);
+                    layer.rotate_left(split);
+                }
+                layer
+            })
+            .collect();
 
         // --- Pass 1: Compute desired next tile for each creep ---
         let mut leader_moves: HashMap<Handle, (Position, Option<Position>)> = HashMap::new();
@@ -975,16 +1055,26 @@ where
                     }
                 }
                 Err(err) => {
-                    // A live requested creep whose next step could not be computed (typically
-                    // `PathNotFound` under per-tick ops-budget exhaustion) still OCCUPIES its
-                    // tile through the movement phase — the third instance of the Pass-1
-                    // occupancy hole (fatigued, border-crosser, now path-error): dropped from
-                    // the resolver's world, it was an invisible immovable post the resolver
+                    // A live requested creep whose next step could not be computed still
+                    // OCCUPIES its tile through the movement phase — the third instance of the
+                    // Pass-1 occupancy hole (fatigued, border-crosser, now path-error): dropped
+                    // from the resolver's world, it was an invisible immovable post the resolver
                     // granted other creeps through, and the engine rejected every such intent
                     // (the dense-crowd `failed_coordination` flood — pathless creeps were the
                     // wedge nuclei of the N≥40 pinch livelock).
+                    //
+                    // The two failure kinds post DIFFERENTLY: a BUDGET miss (the search could not
+                    // run this tick) stays displaceable per its request — it is a transient, not
+                    // an obstacle — while an unreachable target keeps the immovable post. See
+                    // `budget_missed_occupant`.
                     leader_moves.insert(*entity, (creep_pos, None));
-                    resolved_creeps.insert(*entity, stationary_occupant(*entity, creep_pos, request));
+                    let occupant = match err {
+                        MovementFailure::PathBudgetExhausted => {
+                            budget_missed_occupant(*entity, creep_pos, request)
+                        }
+                        _ => stationary_occupant(*entity, creep_pos, request),
+                    };
+                    resolved_creeps.insert(*entity, occupant);
                     results.insert(*entity, MovementResult::Failed(err));
                 }
             }
@@ -1107,6 +1197,23 @@ where
                 continue;
             }
             if results.results.contains_key(entity) {
+                // A BUDGET-MISSED creep (`budget_missed_occupant`) can still have been DISPLACED
+                // by a shove: its evacuation move must be issued (the shover's move into its tile
+                // is only consistent if this one executes). Its result stays the budget miss —
+                // its own request was not served this tick.
+                if matches!(
+                    results.get(entity),
+                    Some(MovementResult::Failed(MovementFailure::PathBudgetExhausted))
+                ) && resolved.final_pos != resolved.current_pos
+                {
+                    if let Ok(creep) = external.get_creep(*entity) {
+                        if let Some(dir) = resolved.current_pos.get_direction_to(resolved.final_pos) {
+                            if creep.move_direction(dir).is_ok() {
+                                executed_one_move = true;
+                            }
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -1463,14 +1570,22 @@ where
         };
 
         if should_pathfind {
-            match self.generate_path(
+            let generated = self.generate_path(
                 external,
                 destination,
                 range,
                 request,
                 creep_pos,
                 &stuck_state_for_gen,
-            ) {
+            );
+            // FIRST-PATH ROUND-ROBIN: a pathless creep whose search was SERVED (ran with its full
+            // natural budget or completed — anything but a budget miss) advances the cursor, so
+            // next tick's rotation starts after it. A budget-missed creep is deliberately NOT
+            // recorded: it is first in line next tick.
+            if needs_path && !matches!(generated, Err(MovementFailure::PathBudgetExhausted)) {
+                self.first_path_cursor = Some(entity);
+            }
+            match generated {
                 Ok(path_points) => {
                     let creep_data = external
                         .get_creep_movement_data(entity)
@@ -1655,11 +1770,12 @@ where
         }
 
         if self.is_over_tick_limit() {
-            return Err(MovementFailure::PathNotFound);
+            return Err(MovementFailure::PathBudgetExhausted);
         }
 
         let goals: Vec<(Position, u32)> = targets.iter().map(|t| (t.pos, t.range)).collect();
 
+        // Same reserve-then-refund pool accounting as `generate_path`.
         let flee_ops = 2000u32;
         let mut allowed_ops = flee_ops.min(self.pathfinding_ops_budget_remaining);
         if let Some((get_cpu, limit)) = &self.tick_limit {
@@ -1667,7 +1783,7 @@ where
             allowed_ops = allowed_ops.min(cpu_left);
         }
         if allowed_ops == 0 {
-            return Err(MovementFailure::PathNotFound);
+            return Err(MovementFailure::PathBudgetExhausted);
         }
         self.pathfinding_ops_budget_remaining -= allowed_ops;
 
@@ -1701,6 +1817,7 @@ where
         // only a genuinely EMPTY path (nowhere to go at all) is a failure. Move-TOWARD searches
         // keep incomplete-is-failure (`generate_path` below): a partial path toward a goal can
         // dead-end short of it — that asymmetry is the point.
+        self.pathfinding_ops_budget_remaining += allowed_ops - result.ops.min(allowed_ops);
         if result.path.is_empty() {
             return Err(MovementFailure::PathNotFound);
         }
@@ -1720,11 +1837,14 @@ where
     where
         S: MovementSystemExternal<Handle>,
     {
+        // CPU-side refusals: the search cannot START this tick. A budget condition, not a
+        // reachability verdict — `PathBudgetExhausted` keeps the creep displaceable and first in
+        // the next tick's rotation.
         if self.is_over_tick_limit() {
-            return Err(MovementFailure::PathNotFound);
+            return Err(MovementFailure::PathBudgetExhausted);
         }
         if self.is_over_movement_cap() {
-            return Err(MovementFailure::PathNotFound);
+            return Err(MovementFailure::PathBudgetExhausted);
         }
         // Do not start pathfinding unless we have at least headroom CPU left under the cap (find_route is unbounded).
         if let (Some((get_cpu, start, max)), Some(headroom)) = (
@@ -1733,7 +1853,7 @@ where
         ) {
             let used = (get_cpu)() - start;
             if used + headroom > *max {
-                return Err(MovementFailure::PathNotFound);
+                return Err(MovementFailure::PathBudgetExhausted);
             }
         }
 
@@ -1799,19 +1919,27 @@ where
         };
         let max_ops = (room_names.len() as u32 * 2000 * ops_multiplier).min(MAX_PATHFIND_OPS);
 
-        // Deduct from per-tick pathfinding ops budget (1 op ≈ 0.001 CPU).
+        // RESERVE from the per-tick pathfinding ops pool (1 op ≈ 0.001 CPU); the unused part of
+        // the reservation is REFUNDED after the search from the provider's reported ops, so the
+        // pool bounds real search CPU rather than the search COUNT (a reservation-only pool
+        // admitted ~10 in-room searches per tick whatever they cost, and starved every later
+        // first-path into a failure — the 2026-09-07 MMO wedge). An empty pool, or a search
+        // that had to run BELOW its natural budget and came back incomplete, is a budget miss
+        // (`PathBudgetExhausted`), not a reachability verdict.
         let mut allowed_ops = max_ops.min(self.pathfinding_ops_budget_remaining);
         if let Some((get_cpu, limit)) = &self.tick_limit {
             let cpu_left = ((*limit - (get_cpu)()).max(0.0) * 1000.0) as u32;
             allowed_ops = allowed_ops.min(cpu_left);
         }
         if allowed_ops == 0 {
-            return Err(MovementFailure::PathNotFound);
+            return Err(MovementFailure::PathBudgetExhausted);
         }
         self.pathfinding_ops_budget_remaining -= allowed_ops;
 
         if self.is_over_tick_limit() {
-            return Err(MovementFailure::PathNotFound);
+            // Nothing ran: hand the whole reservation back.
+            self.pathfinding_ops_budget_remaining += allowed_ops;
+            return Err(MovementFailure::PathBudgetExhausted);
         }
 
         let tick_check = self.tick_limit.as_ref().map(|(g, l)| (&**g, *l));
@@ -1840,8 +1968,18 @@ where
             cost_matrix_options.swamp_cost,
         );
 
+        // REFUND the unused reservation (provider-reported ops, clamped to the grant).
+        self.pathfinding_ops_budget_remaining += allowed_ops - result.ops.min(allowed_ops);
+
         if result.incomplete {
-            return Err(MovementFailure::PathNotFound);
+            // Incomplete under a CAPPED grant (pool or CPU trimmed it below its natural
+            // `max_ops`) says nothing about reachability — a budget miss. Incomplete at the FULL
+            // natural budget is today's verdict: unreachable as far as this search can tell.
+            return Err(if allowed_ops < max_ops {
+                MovementFailure::PathBudgetExhausted
+            } else {
+                MovementFailure::PathNotFound
+            });
         }
 
         let mut path_points = result.path;
@@ -1943,7 +2081,7 @@ mod tests {
                 _plain_cost: u8,
                 _swamp_cost: u8,
             ) -> PathfindingResult {
-                PathfindingResult { path: Vec::new(), incomplete: true }
+                PathfindingResult { path: Vec::new(), incomplete: true, ops: 0 }
             }
             fn search_many(
                 &mut self,
@@ -1962,7 +2100,7 @@ mod tests {
                     origin.y(),
                     origin.room_name(),
                 );
-                PathfindingResult { path: vec![step], incomplete: true }
+                PathfindingResult { path: vec![step], incomplete: true, ops: 0 }
             }
             fn find_route(
                 &self,
@@ -2073,7 +2211,7 @@ mod tests {
                     )
                 })
                 .collect();
-            PathfindingResult { path, incomplete: false }
+            PathfindingResult { path, incomplete: false, ops: 0 }
         }
         fn search_many(
             &mut self,
@@ -2085,7 +2223,7 @@ mod tests {
             _plain_cost: u8,
             _swamp_cost: u8,
         ) -> PathfindingResult {
-            PathfindingResult { path: Vec::new(), incomplete: true }
+            PathfindingResult { path: Vec::new(), incomplete: true, ops: 0 }
         }
         fn find_route(
             &self,
@@ -2528,5 +2666,230 @@ mod tests {
         let default = StuckThresholds::default();
         assert_eq!(default.stuck_repath, default.avoid_friendly_creeps);
         assert!(state.needs_repath_with(&default) && state.should_avoid_friendly_creeps_with(&default));
+    }
+
+    // ── Ops-pool accounting pins (the 2026-09-07 MMO movement wedge, ADR 0033 design delta) ──
+
+    /// Pathfinder mock with CONTROLLED ops reporting. `report_ops` = what each search claims to
+    /// have consumed (`None` = the full grant, i.e. nothing to refund — the reservation-only
+    /// shape); `doomed_origins` = origins whose search comes back incomplete at ANY budget (an
+    /// unreachable target). Straight horizontal paths otherwise, same as `CountingPathfinder`.
+    struct OpsPathfinder {
+        report_ops: Option<u32>,
+        doomed_origins: Vec<Position>,
+        origins: Vec<Position>,
+    }
+    impl PathfindingProvider for OpsPathfinder {
+        fn search(
+            &mut self,
+            origin: Position,
+            goal: Position,
+            _range: u32,
+            _room_callback: &mut dyn FnMut(RoomName) -> Option<LocalCostMatrix>,
+            max_ops: u32,
+            _plain_cost: u8,
+            _swamp_cost: u8,
+        ) -> PathfindingResult {
+            self.origins.push(origin);
+            let ops = self.report_ops.map_or(max_ops, |o| o.min(max_ops));
+            if self.doomed_origins.contains(&origin) {
+                return PathfindingResult { path: Vec::new(), incomplete: true, ops };
+            }
+            let y = origin.y().u8();
+            let room = origin.room_name();
+            let path = (origin.x().u8() + 1..=goal.x().u8())
+                .map(|x| Position::new(RoomCoordinate::new(x).unwrap(), RoomCoordinate::new(y).unwrap(), room))
+                .collect();
+            PathfindingResult { path, incomplete: false, ops }
+        }
+        fn search_many(
+            &mut self,
+            _origin: Position,
+            _goals: &[(Position, u32)],
+            _flee: bool,
+            _room_callback: &mut dyn FnMut(RoomName) -> Option<LocalCostMatrix>,
+            _max_ops: u32,
+            _plain_cost: u8,
+            _swamp_cost: u8,
+        ) -> PathfindingResult {
+            PathfindingResult { path: Vec::new(), incomplete: true, ops: 0 }
+        }
+        fn find_route(
+            &self,
+            _from: RoomName,
+            _to: RoomName,
+            _room_callback: &dyn Fn(RoomName, RoomName) -> f64,
+        ) -> Result<Vec<RouteStep>, String> {
+            Ok(Vec::new())
+        }
+        fn get_room_linear_distance(&self, _from: RoomName, _to: RoomName) -> u32 {
+            0
+        }
+        fn is_tile_walkable(&self, _pos: Position) -> bool {
+            true
+        }
+    }
+
+    fn issued_target(sink: &Rc<RefCell<HashMap<u32, Direction>>>, id: u32, from: Position) -> Option<Position> {
+        sink.borrow().get(&id).copied().map(|dir| {
+            let off = dir.into_offset();
+            pos((from.x().u8() as i32 + off.0) as u8, (from.y().u8() as i32 + off.1) as u8)
+        })
+    }
+
+    /// REFUND pin: the per-tick ops pool bounds what searches actually COST, not how many run.
+    /// Three pathless creeps, a 4000-op pool, in-room searches that each reserve 2000 but report
+    /// 100 consumed: with the refund all three are pathed and the pool shows 300 used; a
+    /// reservation-only pool (the pre-fix shape) spent 4000 on the first two and failed the
+    /// third into `PathNotFound` for free — the count cap that starved every later first-path.
+    #[test]
+    fn refund_of_unused_reservation_leaves_budget_for_later_searches() {
+        let sink: Rc<RefCell<HashMap<u32, Direction>>> = Rc::new(RefCell::new(HashMap::new()));
+        let mut external = StubExternal {
+            positions: [(1u32, pos(10, 20)), (2u32, pos(10, 25)), (3u32, pos(10, 30))].into_iter().collect(),
+            data: HashMap::new(),
+            sink: sink.clone(),
+        };
+        let mut pf = OpsPathfinder { report_ops: Some(100), doomed_origins: Vec::new(), origins: Vec::new() };
+        let mut cache = CostMatrixCache::default();
+        let mut cms = CostMatrixSystem::new(&mut cache, Box::new(NullCostSource));
+        let mut system = MovementSystem::new(&mut cms, &mut pf, None);
+        system.set_pathfinding_ops_budget(4000);
+        let mut data = MovementData::new();
+        for (id, y) in [(1u32, 20u8), (2, 25), (3, 30)] {
+            data.move_to(id, pos(20, y));
+        }
+        let results = system.process(&mut external, data);
+
+        let stats = system.tick_stats();
+        assert_eq!(
+            stats.ops_consumed, 300,
+            "the pool must charge the provider-reported ops (3 × 100), not the 2000-op reservations"
+        );
+        for id in 1..=3u32 {
+            assert!(
+                matches!(results.get(&id), Some(MovementResult::Moving)),
+                "creep {id} must be pathed and moving under a refunded pool, got {:?}",
+                results.get(&id)
+            );
+            assert!(sink.borrow().contains_key(&id), "creep {id} must be issued its first step");
+        }
+    }
+
+    /// FAILURE-KIND pin: a creep whose first-path search could not run for BUDGET reasons is a
+    /// transient, not an obstacle — it stays displaceable this tick (a higher-priority mover
+    /// shoves it and takes its tile, the same tick), and reports `PathBudgetExhausted`. A creep
+    /// whose target is genuinely UNREACHABLE (incomplete at the full natural budget) keeps
+    /// today's immovable post (`PathNotFound`; the mover is denied and sidesteps). Posting the
+    /// budget miss as an unshoveable occupant is what froze haulers next to empty extensions.
+    #[test]
+    fn budget_missed_creep_stays_displaceable_while_unreachable_keeps_the_post() {
+        let mover_from = pos(14, 25);
+        let blocker_at = pos(15, 25);
+
+        // Returns (mover's issued target, blocker's issued direction, blocker's result).
+        let run = |pool: u32, doomed: Vec<Position>| {
+            let sink: Rc<RefCell<HashMap<u32, Direction>>> = Rc::new(RefCell::new(HashMap::new()));
+            let mut external = StubExternal {
+                positions: [(1u32, mover_from), (2u32, blocker_at)].into_iter().collect(),
+                data: HashMap::new(),
+                sink: sink.clone(),
+            };
+            // Full-grant reporting: nothing is refunded, so the pool binds exactly by reservation.
+            let mut pf = OpsPathfinder { report_ops: None, doomed_origins: doomed, origins: Vec::new() };
+            let mut cache = CostMatrixCache::default();
+            let mut cms = CostMatrixSystem::new(&mut cache, Box::new(NullCostSource));
+            let mut system = MovementSystem::new(&mut cms, &mut pf, None);
+            system.set_pathfinding_ops_budget(pool);
+            let mut data = MovementData::new();
+            // Handle 1 is processed first (Handle-sorted, no cursor) and outranks the blocker.
+            data.move_to(1u32, pos(20, 25)).priority(MovementPriority::High);
+            data.move_to(2u32, pos(30, 25));
+            let results = system.process(&mut external, data);
+            let blocker_result = results.get(&2).cloned();
+            let blocker_dir = sink.borrow().get(&2).copied();
+            (issued_target(&sink, 1, mover_from), blocker_dir, blocker_result)
+        };
+
+        // BUDGET MISS: a 2000-op pool is fully reserved by the mover's search; the blocker's
+        // first-path gets allowed_ops == 0. It must stay shoveable: the mover takes its tile
+        // and the blocker is issued its evacuation move the same tick.
+        let (target, blocker_dir, blocker_result) = run(2000, Vec::new());
+        assert!(
+            matches!(blocker_result, Some(MovementResult::Failed(MovementFailure::PathBudgetExhausted))),
+            "an ops-pool miss must report PathBudgetExhausted, got {blocker_result:?}"
+        );
+        assert_eq!(target, Some(blocker_at), "the High mover must displace the budget-missed creep and take its tile");
+        assert!(blocker_dir.is_some(), "the budget-missed creep must be issued its evacuation move — it is shoveable, not a post");
+
+        // UNREACHABLE: ample pool, the blocker's search is incomplete at its full natural budget.
+        // Today's semantics hold: PathNotFound, an immovable post; the mover sidesteps.
+        let (target, blocker_dir, blocker_result) = run(20_000, vec![blocker_at]);
+        assert!(
+            matches!(blocker_result, Some(MovementResult::Failed(MovementFailure::PathNotFound))),
+            "a full-budget incomplete search must still report PathNotFound, got {blocker_result:?}"
+        );
+        let target = target.expect("the denied mover must still be issued a sidestep");
+        assert_ne!(target, blocker_at, "an unreachable-target creep keeps its immovable post");
+        assert!(blocker_dir.is_none(), "an immovable post is never issued a move");
+    }
+
+    /// ROUND-ROBIN pin: under a saturated pool (N pathless creeps, budget for k searches per
+    /// tick), every creep's first-path search is served within ⌈N/k⌉ ticks. Six doomed creeps
+    /// (unreachable targets, so they stay pathless — the wedge's steady state), a 4000-op pool
+    /// (k = 2 full-grant in-room searches), the host feeding the cursor back each tick: ticks 1-3
+    /// search {1,2}, {3,4}, {5,6}. Without the rotation the Handle-sorted order searched {1,2}
+    /// every tick and creeps 3-6 re-reserved, missed, and re-entered `needs_path` forever.
+    #[test]
+    fn saturated_pool_serves_every_first_path_within_ceil_n_over_k_ticks() {
+        let sink: Rc<RefCell<HashMap<u32, Direction>>> = Rc::new(RefCell::new(HashMap::new()));
+        let ids: Vec<u32> = (1..=6).collect();
+        let origin_of = |id: u32| pos(10, 10 + id as u8);
+        let mut external = StubExternal {
+            positions: ids.iter().map(|&id| (id, origin_of(id))).collect(),
+            data: HashMap::new(),
+            sink,
+        };
+        let mut pf = OpsPathfinder {
+            report_ops: None,
+            doomed_origins: ids.iter().map(|&id| origin_of(id)).collect(),
+            origins: Vec::new(),
+        };
+
+        let mut cursor = None;
+        let mut served_per_tick: Vec<Vec<u32>> = Vec::new();
+        for _tick in 0..3 {
+            let mut cache = CostMatrixCache::default();
+            let mut cms = CostMatrixSystem::new(&mut cache, Box::new(NullCostSource));
+            let mut system = MovementSystem::new(&mut cms, &mut pf, None);
+            system.set_pathfinding_ops_budget(4000);
+            system.set_first_path_cursor(cursor);
+            let mut data = MovementData::new();
+            for &id in &ids {
+                data.move_to(id, pos(20, 10 + id as u8));
+            }
+            let results = system.process(&mut external, data);
+            cursor = system.first_path_cursor();
+            let served: Vec<u32> = ids
+                .iter()
+                .copied()
+                .filter(|id| matches!(results.get(id), Some(MovementResult::Failed(MovementFailure::PathNotFound))))
+                .collect();
+            let missed = ids
+                .iter()
+                .filter(|id| matches!(results.get(id), Some(MovementResult::Failed(MovementFailure::PathBudgetExhausted))))
+                .count();
+            assert_eq!(served.len() + missed, ids.len(), "every pathless creep is either served or budget-missed");
+            served_per_tick.push(served);
+        }
+
+        assert_eq!(
+            served_per_tick,
+            vec![vec![1, 2], vec![3, 4], vec![5, 6]],
+            "k = 2 full-grant searches per tick must rotate through all N = 6 creeps in ⌈N/k⌉ = 3 ticks"
+        );
+        let mut all_served: Vec<u32> = served_per_tick.into_iter().flatten().collect();
+        all_served.sort_unstable();
+        assert_eq!(all_served, ids, "every creep served exactly once across the rotation");
     }
 }

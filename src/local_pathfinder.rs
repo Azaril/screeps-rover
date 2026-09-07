@@ -219,7 +219,9 @@ impl LocalPathfinder {
     /// an arbitrary cost for scored). `dijkstra` forces a uniform-cost flood (priority = `g`,
     /// exploring outward by path cost and evaluating `score` at each tile) — used by the scored
     /// search where `score` is an arbitrary positive cost, not an admissible distance heuristic.
-    /// Returns `(path, incomplete)`.
+    /// Returns `(path, incomplete, ops)` — `ops` is the settled-tile count, the headless analogue
+    /// of the engine's `SearchResults.ops` (what the movement system refunds against its
+    /// per-tick reservation).
     #[allow(clippy::too_many_arguments)]
     fn run<S, B>(
         grid: &Grid,
@@ -235,7 +237,7 @@ impl LocalPathfinder {
         // forking the traversal (so it stays byte-identical to [`search_scored`]). All distance-search
         // callers pass a no-op.
         on_settle: &mut dyn FnMut(u8, u8, u32, i64),
-    ) -> (Vec<Position>, bool)
+    ) -> (Vec<Position>, bool, u32)
     where
         S: Fn(i32, i32) -> bool,
         // `score(x, y, g)` — `g` is the settled path-cost from the origin, exposed so a scored search
@@ -246,7 +248,7 @@ impl LocalPathfinder {
         let priority = |x: u8, y: u8, g: u32| if dijkstra { g } else { score_priority(&score, x, y, g) };
         let (ox, oy) = origin;
         if satisfied(ox as i32, oy as i32) {
-            return (Vec::new(), false); // already there
+            return (Vec::new(), false, 0); // already there
         }
         let mut g = Box::new([[u32::MAX; DIM]; DIM]);
         let mut came: Box<CameFrom> = Box::new([[None; DIM]; DIM]);
@@ -261,7 +263,7 @@ impl LocalPathfinder {
                 continue; // stale heap entry
             }
             if satisfied(x as i32, y as i32) {
-                return (reconstruct(&came, origin, (x, y), room), false);
+                return (reconstruct(&came, origin, (x, y), room), false, ops);
             }
             let s = score(x as i32, y as i32, gc);
             on_settle(x, y, gc, s);
@@ -270,7 +272,7 @@ impl LocalPathfinder {
             }
             ops += 1;
             if ops >= max_ops {
-                return (reconstruct(&came, origin, (best.1, best.2), room), true);
+                return (reconstruct(&came, origin, (best.1, best.2), room), true, ops);
             }
             for (dx, dy) in NEIGHBORS {
                 let nx = x as i32 + dx;
@@ -291,7 +293,7 @@ impl LocalPathfinder {
                 }
             }
         }
-        (reconstruct(&came, origin, (best.1, best.2), room), true)
+        (reconstruct(&came, origin, (best.1, best.2), room), true, ops)
     }
 
     /// Bounded **scored** single-room search: flood outward from `origin` (cost-bounded by `max_ops`,
@@ -317,15 +319,15 @@ impl LocalPathfinder {
         let room = origin.room_name();
         let grid = match room_callback(room) {
             Some(cm) => snapshot(&cm, room),
-            None => return PathfindingResult { path: Vec::new(), incomplete: true },
+            None => return PathfindingResult { path: Vec::new(), incomplete: true, ops: 0 },
         };
         // Never "satisfied" → flood to max_ops / exhaustion by path cost; `run` returns the min-cost
         // tile seen (its `best` tracking), so the path's last tile is the chosen goal.
         let satisfied = |_x: i32, _y: i32| false;
         let score = |x: i32, y: i32, g: u32| cost(to_pos(x as u8, y as u8, room), g);
-        let (path, incomplete) =
+        let (path, incomplete, ops) =
             Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, true, satisfied, score, &mut |_x, _y, _g, _s| {});
-        PathfindingResult { path, incomplete }
+        PathfindingResult { path, incomplete, ops }
     }
 
     /// Bounded **scored-SET** single-room search: the SAME one bounded Dijkstra flood as
@@ -453,7 +455,7 @@ impl PathfindingProvider for LocalPathfinder {
         // workaround (the old search rejected a cross-room goal outright). `incomplete` ⇒ best-effort
         // toward the closest-reached tile. Single-room is the degenerate case (no border is crossed).
         if origin.get_range_to(goal) <= range {
-            return PathfindingResult { path: Vec::new(), incomplete: false };
+            return PathfindingResult { path: Vec::new(), incomplete: false, ops: 0 };
         }
         let mut grids: HashMap<RoomName, Option<Box<Grid>>> = HashMap::new();
         let mut g: HashMap<Position, u32> = HashMap::new();
@@ -468,7 +470,7 @@ impl PathfindingProvider for LocalPathfinder {
                 continue; // stale heap entry
             }
             if pos.get_range_to(goal) <= range {
-                return PathfindingResult { path: reconstruct_pos(&came, origin, pos), incomplete: false };
+                return PathfindingResult { path: reconstruct_pos(&came, origin, pos), incomplete: false, ops };
             }
             let h = pos.get_range_to(goal);
             if h < best.0 {
@@ -476,7 +478,7 @@ impl PathfindingProvider for LocalPathfinder {
             }
             ops += 1;
             if ops >= max_ops {
-                return PathfindingResult { path: reconstruct_pos(&came, origin, best.1), incomplete: true };
+                return PathfindingResult { path: reconstruct_pos(&came, origin, best.1), incomplete: true, ops };
             }
             for (dx, dy) in NEIGHBORS {
                 let np = match pos.checked_add((dx, dy)) {
@@ -503,7 +505,7 @@ impl PathfindingProvider for LocalPathfinder {
                 }
             }
         }
-        PathfindingResult { path: reconstruct_pos(&came, origin, best.1), incomplete: true }
+        PathfindingResult { path: reconstruct_pos(&came, origin, best.1), incomplete: true, ops }
     }
 
     fn search_many(
@@ -523,14 +525,14 @@ impl PathfindingProvider for LocalPathfinder {
             .map(|(p, r)| (p.x().u8() as i32, p.y().u8() as i32, *r))
             .collect();
         if local.is_empty() {
-            return PathfindingResult { path: Vec::new(), incomplete: true };
+            return PathfindingResult { path: Vec::new(), incomplete: true, ops: 0 };
         }
         let grid = match room_callback(room) {
             Some(cm) => snapshot(&cm, room),
-            None => return PathfindingResult { path: Vec::new(), incomplete: true },
+            None => return PathfindingResult { path: Vec::new(), incomplete: true, ops: 0 },
         };
         let min_dist = |x: i32, y: i32| local.iter().map(|(gx, gy, _)| cheby(x, y, *gx, *gy)).min().unwrap();
-        let (path, incomplete) = if flee {
+        let (path, incomplete, ops) = if flee {
             // Goal: outside EVERY flee range. Best-effort: maximize the min distance (score negated).
             let satisfied = |x: i32, y: i32| local.iter().all(|(gx, gy, r)| cheby(x, y, *gx, *gy) > *r);
             let score = |x: i32, y: i32, _g: u32| -(min_dist(x, y) as i64);
@@ -541,7 +543,7 @@ impl PathfindingProvider for LocalPathfinder {
             let score = |x: i32, y: i32, _g: u32| min_dist(x, y) as i64;
             Self::run(&grid, (origin.x().u8(), origin.y().u8()), room, max_ops, plain_cost, false, satisfied, score, &mut |_x, _y, _g, _s| {})
         };
-        PathfindingResult { path, incomplete }
+        PathfindingResult { path, incomplete, ops }
     }
 
     /// Room-level route via a weighted Dijkstra over the room graph — the headless analogue of
